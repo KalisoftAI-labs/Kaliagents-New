@@ -86,453 +86,311 @@ Industrial_rec_system/
     └── engine.py                   # Recommendation engine
 ```
 
-## 🧠 How It Works - Detailed Technical Overview
+## 🧠 How It Works - Visual Overview
 
-This section explains in detail how the recommendation engine and search functionality work under the hood.
+### System Architecture
 
----
+```mermaid
+graph TB
+    A[User Selects Product] --> B{Choose Algorithm}
+    B -->|Hybrid| C[70% Rule-Based + 30% ML]
+    B -->|Rule-Based| D[Industry Logic]
+    B -->|Content-Based| E[ML Similarity]
 
-### 🔍 Product Search System
+    C --> F[Combine Scores]
+    D --> F
+    E --> F
 
-The search system allows you to find products using keywords, and it works by:
+    F --> G[Rank by Score]
+    G --> H[Display Top N Results]
 
-**1. Multi-Field Search**
-The system searches across multiple fields simultaneously:
-
-- **Product Description** (raw_description): Main product name/description
-- **Category**: High-level category (Fasteners, Packaging, etc.)
-- **Sub-Category**: Specific product type (Bolt, Nut, Washer, etc.)
-- **Brand**: Manufacturer name (3M, HILTI, GODREJ, etc.)
-
-**2. Search Process**
-
-```python
-# When you search for "3M"
-- Searches in raw_description: "3M Speedglas G5-01 Welding Helmet..."
-- Searches in brand: "3M"
-- Searches in category: No match
-- Returns all products matching ANY field
-```
-
-**3. Case-Insensitive Matching**
-
-- Search is not case-sensitive
-- "3m", "3M", "3M" all return the same results
-- Partial matches work: "bolt" finds "HEX BOLT", "ANCHOR BOLT", etc.
-
-**Example Search Scenarios:**
-
-- **Search "M20"**: Finds all products with M20 in description or dimension
-- **Search "3M"**: Finds all 3M branded products
-- **Search "welding"**: Finds welding helmets, rods, masks, etc.
-- **Search "HILTI"**: Finds all HILTI products
-
----
-
-### 🎯 Recommendation Engine - How Recommendations Are Generated
-
-The system uses **three different algorithms** to generate recommendations. Here's how each works:
-
----
-
-#### **METHOD 1: Rule-Based Recommendations** 🎲
-
-This method uses **industry-specific logic** and **product compatibility patterns**.
-
-**Step-by-Step Process:**
-
-**Step 1: Initialize Scores**
-
-- All candidate products start with score = 0
-- The selected product is excluded from candidates
-
-**Step 2: Base Scoring (General Compatibility)**
-
-```
-Category Match:        +25 points
-Sub-Category Match:    +40 points
-Brand Match:           +30 points (if brand is known)
-Dimension Match:       +50 points (if dimension exists)
-```
-
-**Example:** If you select "M 20 HEX BOLT M S"
-
-- Other fasteners get +25 points
-- Other bolts get +40 points
-- Products with M20 dimension get +50 points
-
-**Step 3: Ecosystem-Specific Logic (Smart Pairing)**
-
-**A. FASTENERS ECOSYSTEM** 🔩
-
-```python
-If product is a BOLT:
-  - All NUTS with same dimension → +80 points
-  - All WASHERS with same dimension → +70 points
-  - Exact dimension match (M20 → M20) → +100 points
-
-If product is a NUT:
-  - All BOLTS with same dimension → +80 points
-  - All WASHERS with same dimension → +70 points
-
-If product is a WASHER:
-  - All BOLTS with same dimension → +70 points
-  - All NUTS with same dimension → +70 points
-```
-
-**Real Example:**
-
-```
-Selected: "M 20 X 100 HEX BOLT M S"
-- Base: Category=Fasteners (+25), SubCat=Bolt (+40), Dimension=M20 (+50)
-- M 20 NYLOCK NUT: +25 +40 +50 +80 (nut ecosystem) +100 (M20 match) = 255 points!
-- M 20 WASHER: +25 +40 +50 +70 (washer ecosystem) +100 (M20 match) = 235 points
-```
-
-**B. PACKAGING ECOSYSTEM** 📦
-
-```python
-If product has "STRAP":
-  - Products with "BUCKLE" → +100 points
-  - Same dimension buckles → +50 additional points
-
-If product has "BUCKLE":
-  - Products with "STRAP" → +100 points
-  - Same dimension straps → +50 additional points
-
-If product has "BAG" or "POLY":
-  - Products with "TAPE" or "STRAP" → +60 points
-```
-
-**Real Example:**
-
-```
-Selected: "POLYESTER CORDED STRAP 16 MM"
-- BUCKLES SIZE 16MM: +25 +40 +50 (dim match) +100 (strap-buckle pair) +50 (16MM) = 265 points!
-```
-
-**C. CHEMICALS & PAINTS ECOSYSTEM** 🎨
-
-```python
-If product has "PAINT" or "COATING":
-  - Products with "ROLLER|BRUSH|THINNER|SOLVENT" → +90 points
-  - Safety & Hygiene items → +40 points
-
-If product has "OIL" or "GREASE":
-  - Products with "FUNNEL|CAN|BRUSH" → +70 points
-```
-
-**D. SAFETY & HYGIENE ECOSYSTEM** 🦺
-
-```python
-If product has "WELDING" or "HELMET":
-  - Other welding gear (GLOVE, APRON) → +80 points
-
-If product has "MASK":
-  - SANITIZER, GLOVE products → +70 points
-
-If product has "EAR" (muffs/plugs):
-  - Other PPE (MASK, GLOVE, GOGGLE) → +60 points
-```
-
-**E. BRAND ECOSYSTEMS** 🏷️
-
-```python
-If product is 3M or HILTI:
-  - Other products from same brand → +50 additional points
-```
-
-**Final Scoring Example:**
-
-```
-Product: "M 20 X 100 HEX BOLT M S" (Fasteners/Bolt/Unknown/M20)
-
-Candidate: "M 20 NYLOCK NUT"
-  Category match (Fasteners):           +25
-  Sub-category related (Nut-Bolt):      +40
-  Brand match (both Unknown):           +0
-  Dimension match (M20 = M20):          +50
-  Fastener ecosystem (Bolt→Nut):        +80
-  Exact size match (M20 size number):   +100
-  ───────────────────────────────────
-  TOTAL SCORE:                          295 points ⭐
-
-Candidate: "BUCKLES SIZE 16MM"
-  Category match (Packaging ≠ Fasteners): +0
-  Sub-category match:                     +0
-  Brand match:                            +0
-  Dimension match:                        +0
-  ───────────────────────────────────
-  TOTAL SCORE:                            0 points
+    style A fill:#e1f5ff
+    style H fill:#c8e6c9
+    style C fill:#fff9c4
 ```
 
 ---
 
-#### **METHOD 2: Content-Based Recommendations** 🤖
+### 🔍 Product Search - How It Works
 
-This method uses **Machine Learning** (TF-IDF + Cosine Similarity) to find similar products based on text.
+```mermaid
+flowchart LR
+    A[Search Query: '3M'] --> B[Search in Description]
+    A --> C[Search in Brand]
+    A --> D[Search in Category]
+    A --> E[Search in Sub-Category]
 
-**Step-by-Step Process:**
+    B --> F{Match Found?}
+    C --> F
+    D --> F
+    E --> F
 
-**Step 1: Text Preprocessing**
+    F -->|Yes| G[Return Product]
+    F -->|No| H[Skip Product]
 
-```python
-For each product, combine all text features:
-- Product description (lowercase)
-- Category (lowercase)
-- Sub-category (lowercase)
-- Brand (lowercase)
-- Dimension (lowercase)
+    G --> I[Show All Matches]
 
-Example:
-"M 20 X 100 HEX BOLT M S" → "m 20 x 100 hex bolt m s fasteners bolt unknown m20"
+    style A fill:#e3f2fd
+    style I fill:#c8e6c9
 ```
 
-**Step 2: TF-IDF Vectorization**
+**Quick Examples:**
 
-```
-TF-IDF = Term Frequency - Inverse Document Frequency
-- Common words get low scores (like "the", "and")
-- Unique words get high scores (like "M20", "HILTI")
-- Creates a 500-feature vector for each product
-```
-
-**Step 3: Cosine Similarity Calculation**
-
-```python
-# Measures how similar two product vectors are
-# Score ranges from 0 (completely different) to 1 (identical)
-
-similarity = cosine_similarity(product_A_vector, product_B_vector)
-# Convert to 0-100 scale for display
-score = similarity * 100
-```
-
-**Example:**
-
-```
-Selected: "M 20 X 100 HEX BOLT M S"
-Vector: [0.42(m), 0.38(20), 0.51(hex), 0.49(bolt), ...]
-
-Candidate: "M 20X140 HEX BOLT M S"
-Vector: [0.41(m), 0.39(20), 0.50(hex), 0.48(bolt), ...]
-
-Similarity: 0.93 → Score: 93/100 (Very similar!)
-
-Candidate: "HAND SANITIZER 5 LTR"
-Vector: [0.65(hand), 0.52(sanitizer), 0.31(ltr), ...]
-
-Similarity: 0.03 → Score: 3/100 (Not similar)
-```
-
-**What Content-Based Is Good At:**
-
-- Finding products with similar descriptions
-- Discovering related items you didn't know about
-- Working without predefined rules
-- Text pattern matching
-
-**What It's Not Good At:**
-
-- Understanding dimension compatibility (doesn't know M20 bolt needs M20 nut)
-- Industry-specific logic (doesn't know bolts need nuts)
-- Cross-category recommendations
+- 🔎 "M20" → Finds: M20 bolts, M20 nuts, M20 washers
+- 🔎 "3M" → Finds: All 3M brand products
+- 🔎 "welding" → Finds: Welding helmets, rods, safety gear
 
 ---
 
-#### **METHOD 3: Hybrid Recommendations** ⚡ (DEFAULT & BEST)
+### 🎯 Three Recommendation Algorithms
 
-This method **combines the best of both worlds**.
+```mermaid
+graph TD
+    A[Product Selected: M20 Bolt] --> B[Rule-Based 🎲]
+    A --> C[Content-Based 🤖]
+    A --> D[Hybrid ⚡ BEST]
 
-**Formula:**
+    B --> B1[Check Category +25pts]
+    B --> B2[Check Sub-Category +40pts]
+    B --> B3[Check Dimension +50pts]
+    B --> B4[Apply Ecosystem Rules +100pts]
+    B1 --> B5[Score: 0-300]
+    B2 --> B5
+    B3 --> B5
+    B4 --> B5
 
-```python
-Hybrid Score = (0.7 × Rule-Based Score) + (0.3 × Content-Based Score)
-```
+    C --> C1[Convert to Text Vector]
+    C --> C2[Calculate TF-IDF]
+    C --> C3[Compute Similarity]
+    C --> C4[Score: 0-100]
 
-**Step-by-Step Process:**
+    D --> D1[70% Rule Score]
+    D --> D2[30% ML Score]
+    D1 --> D3[Combined Score]
+    D2 --> D3
 
-**Step 1: Get Rule-Based Scores**
+    B5 --> E[Final Results]
+    C4 --> E
+    D3 --> E
 
-```python
-# Run rule-based algorithm
-# Get top 20 candidates with scores
-```
-
-**Step 2: Get Content-Based Scores**
-
-```python
-# Calculate TF-IDF similarity
-# Get similarity scores for all products
-```
-
-**Step 3: Combine Scores**
-
-```python
-For each candidate:
-    rule_score = rule_based_result
-    content_score = similarity * 100
-    final_score = (0.7 * rule_score) + (0.3 * content_score)
-```
-
-**Real Example:**
-
-```
-Product: "M 20 X 100 HEX BOLT M S"
-
-Candidate: "M 20 NYLOCK NUT"
-  Rule-Based Score:      255 points
-  Content-Based Score:   65 points (text similarity)
-  Hybrid Score: (0.7 × 255) + (0.3 × 65) = 178.5 + 19.5 = 198 points ⭐
-
-Candidate: "M 20X140 HEX BOLT M S"
-  Rule-Based Score:      215 points (same size, same type)
-  Content-Based Score:   93 points (very similar text)
-  Hybrid Score: (0.7 × 215) + (0.3 × 93) = 150.5 + 27.9 = 178.4 points
-
-Candidate: "BUCKLES SIZE 16MM"
-  Rule-Based Score:      0 points (unrelated)
-  Content-Based Score:   5 points (different text)
-  Hybrid Score: (0.7 × 0) + (0.3 × 5) = 0 + 1.5 = 1.5 points (filtered out)
-```
-
-**Why Hybrid Is Best:**
-
-- **70% Rule-Based**: Ensures industry logic and compatibility
-- **30% Content-Based**: Captures text patterns and descriptions
-- **Balances** both domain expertise and ML discovery
-- **Robust** recommendations that make business sense
-
----
-
-### 📊 Scoring Scale & Interpretation
-
-**Understanding Recommendation Scores:**
-
-| Score Range | Quality              | Meaning                                             | Example                                |
-| ----------- | -------------------- | --------------------------------------------------- | -------------------------------------- |
-| **180-200** | ⭐⭐⭐⭐⭐ Excellent | Perfect match - same dimension + complementary type | M20 Bolt → M20 Nut                     |
-| **150-179** | ⭐⭐⭐⭐ Very Good   | Strong compatibility - same category + related      | M20 Bolt → M20 Bolt (different length) |
-| **100-149** | ⭐⭐⭐ Good          | Compatible ecosystem - related products             | Strap → Buckle                         |
-| **50-99**   | ⭐⭐ Moderate        | Same category or related                            | Paint → Brush                          |
-| **0-49**    | ⭐ Low               | Weak similarity - filtered out                      | Bolt → Sanitizer                       |
-
----
-
-### 🎓 Algorithm Selection Guide
-
-**When to use each algorithm:**
-
-| Scenario                         | Best Algorithm          | Why                               |
-| -------------------------------- | ----------------------- | --------------------------------- |
-| **General Use**                  | Hybrid                  | Best balance of logic + discovery |
-| **Standard Industrial Products** | Rule-Based              | Strict compatibility rules        |
-| **Exploring Similar Items**      | Content-Based           | Find text-similar products        |
-| **Fasteners (Bolts, Nuts)**      | Rule-Based or Hybrid    | Dimension matching critical       |
-| **Packaging Items**              | Rule-Based or Hybrid    | Size compatibility matters        |
-| **Safety Equipment**             | Content-Based or Hybrid | Group similar PPE                 |
-| **Unknown Categories**           | Content-Based           | No predefined rules               |
-
----
-
-### 💡 Example Walkthrough: Complete Flow
-
-**User Action:** Select "M 20 X 100 HEX BOLT M S" → Click "Get Recommendations" → Choose "Hybrid" → 5 Results
-
-**System Process:**
-
-1. **Parse Selected Product**
-
-   - Category: Fasteners
-   - Sub-Category: Bolt
-   - Brand: Unknown
-   - Dimension: M20
-
-2. **Rule-Based Calculation** (Top 20)
-
-   - Identify fastener ecosystem
-   - Find M20 dimension products
-   - Apply bolt-nut-washer logic
-   - Score all candidates
-
-3. **Content-Based Calculation**
-
-   - Vectorize: "m 20 x 100 hex bolt m s fasteners bolt unknown m20"
-   - Calculate similarity to all 370 products
-   - Get similarity scores
-
-4. **Hybrid Combination**
-
-   - Combine 70% rule + 30% content
-   - Sort by final score
-   - Return top 5
-
-5. **Display Results**
-   - Show product names
-   - Display scores
-   - Show match strength bar
-
-**Output:**
-
-```
-1. M 20 NYLOCK NUT (Score: 198/200) ⭐⭐⭐⭐⭐
-2. M 20X140 HEX BOLT M S (Score: 178/200) ⭐⭐⭐⭐
-3. NUT M 20 (Score: 187/200) ⭐⭐⭐⭐⭐
-4. Allen Bolt M20X30mm (Score: 173/200) ⭐⭐⭐⭐
-5. M20 WASHER (Score: 165/200) ⭐⭐⭐⭐
+    style A fill:#ffebee
+    style D fill:#fff9c4
+    style E fill:#c8e6c9
 ```
 
 ---
 
-### 🔧 Customizing the System
+### 🎲 Rule-Based Algorithm - Scoring System
 
-**Want to adjust the logic? Here's how:**
+```mermaid
+graph LR
+    A[M20 Bolt Selected] --> B[M20 Nut Candidate]
 
-**1. Change Hybrid Weights**
+    B --> C1[Category: Fasteners ✓<br/>+25 pts]
+    B --> C2[Related Type: Nut-Bolt ✓<br/>+40 pts]
+    B --> C3[Dimension: M20 = M20 ✓<br/>+50 pts]
+    B --> C4[Ecosystem: Bolt→Nut ✓<br/>+80 pts]
+    B --> C5[Size Match: 20 = 20 ✓<br/>+100 pts]
 
-```python
-# In src/engine.py, _hybrid_recommendations method
-# Current: 70% rule, 30% content
-hybrid_score = (0.7 * rule_score) + (0.3 * content_score)
+    C1 --> D[Total: 295 pts]
+    C2 --> D
+    C3 --> D
+    C4 --> D
+    C5 --> D
 
-# Make it more ML-focused (50-50)
-hybrid_score = (0.5 * rule_score) + (0.5 * content_score)
+    D --> E[⭐⭐⭐⭐⭐ Excellent Match!]
 
-# Make it more rule-focused (90-10)
-hybrid_score = (0.9 * rule_score) + (0.1 * content_score)
+    style A fill:#e3f2fd
+    style E fill:#c8e6c9
+    style D fill:#fff9c4
 ```
 
-**2. Add Custom Rules**
+**Scoring Breakdown:**
+| Match Type | Points | Example |
+|------------|--------|---------|
+| Same Category | +25 | Both Fasteners |
+| Same Sub-Category | +40 | Both Bolts |
+| Same Brand | +30 | Both 3M |
+| Same Dimension | +50 | Both M20 |
+| Ecosystem Pair | +80-100 | Bolt ↔ Nut |
+| **Perfect Match** | **295** | **M20 Bolt → M20 Nut** |
 
-```python
-# In src/engine.py, _rule_based_recommendations method
+---
 
-# Example: Recommend tapes with all bags
-if 'BAG' in desc:
-    candidates.loc[candidates['raw_description'].str.contains('TAPE', case=False), 'score'] += 80
+### 🤖 Content-Based Algorithm - ML Similarity
+
+```mermaid
+flowchart TB
+    A[Product: 'M 20 X 100 HEX BOLT M S'] --> B[Text Preprocessing]
+    B --> C['m 20 hex bolt fasteners m20']
+
+    C --> D[TF-IDF Vectorization]
+    D --> E[Vector: 0.42, 0.38, 0.51, 0.49, ...]
+
+    F[All Other Products] --> G[Convert to Vectors]
+    G --> H[Compare with Cosine Similarity]
+
+    E --> H
+    H --> I{Similarity Score}
+
+    I -->|0.93| J[93% Similar: M20X140 HEX BOLT]
+    I -->|0.65| K[65% Similar: M12 HEX BOLT]
+    I -->|0.03| L[3% Similar: Hand Sanitizer]
+
+    J --> M[Return Top Matches]
+    K --> M
+
+    style A fill:#e3f2fd
+    style M fill:#c8e6c9
+    style D fill:#fff9c4
 ```
 
-**3. Adjust Point Values**
+**What It Finds:**
 
-```python
-# Change how much each match is worth
-candidates.loc[candidates['category'] == target['category'], 'score'] += 50  # Was 25
-candidates.loc[candidates['sub_cat'] == target['sub_cat'], 'score'] += 80    # Was 40
+- ✅ Similar descriptions and keywords
+- ✅ Products with matching terms
+- ✅ Text-based patterns
+- ❌ Doesn't understand dimension compatibility
+
+---
+
+### ⚡ Hybrid Algorithm - Best of Both Worlds
+
+```mermaid
+flowchart LR
+    A[M20 Bolt] --> B[Rule-Based Engine]
+    A --> C[Content-Based Engine]
+
+    B --> D[Rule Score: 255]
+    C --> E[ML Score: 65]
+
+    D --> F[× 0.7 = 178.5]
+    E --> G[× 0.3 = 19.5]
+
+    F --> H[Combined: 198 pts]
+    G --> H
+
+    H --> I[Recommendation:<br/>M20 NYLOCK NUT<br/>Score: 198/200 ⭐⭐⭐⭐⭐]
+
+    style A fill:#e3f2fd
+    style I fill:#c8e6c9
+    style H fill:#fff9c4
+```
+
+**Formula:**  
+`Hybrid Score = (0.7 × Rule Score) + (0.3 × ML Score)`
+
+**Why Hybrid is Best:**
+
+- ✅ 70% industry logic ensures compatibility
+- ✅ 30% ML discovers text patterns
+- ✅ Balanced and robust results
+- ✅ Catches both obvious and hidden matches
+
+---
+
+### 📊 Score Interpretation Guide
+
+```mermaid
+graph LR
+    A[Score Range] --> B[180-200: ⭐⭐⭐⭐⭐]
+    A --> C[150-179: ⭐⭐⭐⭐]
+    A --> D[100-149: ⭐⭐⭐]
+    A --> E[50-99: ⭐⭐]
+    A --> F[0-49: ⭐]
+
+    B --> B1[Perfect Match<br/>M20 Bolt → M20 Nut]
+    C --> C1[Excellent<br/>Same category + type]
+    D --> D1[Good<br/>Compatible ecosystem]
+    E --> E1[Moderate<br/>Related category]
+    F --> F1[Low<br/>Filtered out]
+
+    style B fill:#4caf50
+    style C fill:#8bc34a
+    style D fill:#cddc39
+    style E fill:#ffeb3b
+    style F fill:#ff9800
 ```
 
 ---
 
-## 🧠 How It Works
+### 🔄 Complete Workflow - From Click to Results
 
-### 1. Rule-Based Scoring
+```mermaid
+sequenceDiagram
+    participant User
+    participant UI as Web Interface
+    participant Engine as Recommendation Engine
+    participant DB as Product Database
 
-### 🎓 Quick Algorithm Summary
+    User->>UI: Select "M20 X 100 HEX BOLT"
+    User->>UI: Choose "Hybrid" algorithm
+    User->>UI: Click "Get Recommendations"
 
-For those who want a quick overview:
+    UI->>Engine: Request recommendations
+    Engine->>DB: Get product details
+    DB-->>Engine: Category: Fasteners, Dim: M20
 
-**Rule-Based:** Industry logic + dimension matching + compatibility patterns → Best for standard products
-**Content-Based:** TF-IDF text similarity → Best for finding similar descriptions  
-**Hybrid:** 70% rule + 30% content → Best overall performance
+    Engine->>Engine: Run Rule-Based scoring
+    Engine->>Engine: Run ML similarity
+    Engine->>Engine: Combine scores (70/30)
+
+    Engine->>Engine: Sort by score
+    Engine->>Engine: Select top 5
+
+    Engine-->>UI: Return results
+    UI-->>User: Display recommendations
+
+    Note over User,DB: Process takes ~50ms
+```
+
+---
+
+### 🎯 Real Example: M20 Bolt Recommendations
+
+```
+┌─────────────────────────────────────────────┐
+│  Selected Product                           │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  │
+│  M 20 X 100 HEX BOLT M S                    │
+│  Category: Fasteners | Sub: Bolt | Dim: M20 │
+└─────────────────────────────────────────────┘
+                    ↓
+        ╔═══════════════════════╗
+        ║  RECOMMENDATION ENGINE ║
+        ╚═══════════════════════╝
+                    ↓
+┌─────────────────────────────────────────────┐
+│  Top 5 Recommendations                      │
+├─────────────────────────────────────────────┤
+│  1. M 20 NYLOCK NUT           [198/200] ⭐⭐⭐⭐⭐ │
+│     Why: Perfect size match + Bolt→Nut      │
+│                                             │
+│  2. M 20X140 HEX BOLT M S     [178/200] ⭐⭐⭐⭐  │
+│     Why: Same type + dimension              │
+│                                             │
+│  3. NUT M 20                  [187/200] ⭐⭐⭐⭐⭐ │
+│     Why: Complementary fastener             │
+│                                             │
+│  4. Allen Bolt M20X30mm       [173/200] ⭐⭐⭐⭐  │
+│     Why: Same dimension series              │
+│                                             │
+│  5. M20 WASHER                [165/200] ⭐⭐⭐⭐  │
+│     Why: Required for assembly              │
+└─────────────────────────────────────────────┘
+```
+
+---
+
+### 🎓 Algorithm Selection - Quick Guide
+
+| Your Need                  | Best Algorithm    | Why                 |
+| -------------------------- | ----------------- | ------------------- |
+| 🎯 General recommendations | **Hybrid**        | Balanced logic + ML |
+| 🔩 Fasteners (exact fit)   | **Rule-Based**    | Dimension critical  |
+| 📦 Packaging pairs         | **Rule-Based**    | Size compatibility  |
+| 🔍 Find similar items      | **Content-Based** | Text matching       |
+| ⚡ Production use          | **Hybrid**        | Most reliable       |
 
 ---
 
