@@ -5,7 +5,7 @@ const cors = require('cors');
 const bodyParser = require('body-parser');
 const path = require('path');
 const cron = require('node-cron');
-const sqlite3 = require('sqlite3').verbose();
+const { Pool } = require('pg');
 const fs = require('fs');
 const QRCode = require('qrcode');
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
@@ -83,44 +83,179 @@ const generateMenuMessage = () => {
 Example: 1,2,3,12,10`;
 };
 
-// Database setup
-const dbPath = path.join(__dirname, 'database.db');
-const db = new sqlite3.Database(dbPath, (err) => {
-  if (err) {
-    console.error('❌ Database error:', err.message);
-  } else {
-    console.log('📊 Connected to SQLite database');
-    initializeDatabase();
-  }
+// ========================
+// DATABASE SETUP (PostgreSQL)
+// ========================
+const pool = new Pool({
+  host: process.env.DB_HOST || 'localhost',
+  port: process.env.DB_PORT || 5432,
+  database: process.env.DB_NAME || 'swasth_cafe',
+  user: process.env.DB_USER || 'swasth',
+  password: process.env.DB_PASSWORD || 'password',
+  max: 20,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 2000,
 });
 
-const initializeDatabase = () => {
-  db.run(`
-    CREATE TABLE IF NOT EXISTS orders (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      timestamp TEXT NOT NULL,
-      name TEXT NOT NULL,
-      phone TEXT NOT NULL,
-      items TEXT NOT NULL,
-      total_price REAL NOT NULL,
-      status TEXT DEFAULT 'pending'
-    )
-  `, (err) => {
-    if (err) console.error('❌ Orders table error:', err.message);
-    else console.log('✅ Orders table ready');
-  });
+pool.on('error', (err) => {
+  console.error('❌ Unexpected error on idle client:', err.message);
+});
 
-  db.run(`
-    CREATE TABLE IF NOT EXISTS customers (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      phone TEXT UNIQUE NOT NULL,
-      name TEXT NOT NULL,
-      address TEXT
-    )
-  `, (err) => {
-    if (err) console.error('❌ Customers table error:', err.message);
-    else console.log('✅ Customers table ready');
-  });
+pool.on('connect', () => {
+  console.log('✅ PostgreSQL connection established');
+});
+
+const initializeDatabase = async () => {
+  try {
+    // Create customers table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS customers (
+        id SERIAL PRIMARY KEY,
+        phone VARCHAR(20) UNIQUE NOT NULL,
+        name VARCHAR(255) NOT NULL,
+        address TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    console.log('✅ Customers table ready');
+
+    // Create orders table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS orders (
+        id SERIAL PRIMARY KEY,
+        timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        name VARCHAR(255) NOT NULL,
+        phone VARCHAR(20) NOT NULL,
+        items JSONB NOT NULL,
+        total_price DECIMAL(10, 2) NOT NULL,
+        status VARCHAR(50) DEFAULT 'pending',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    console.log('✅ Orders table ready');
+
+    // Create menu table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS menu (
+        id SERIAL PRIMARY KEY,
+        item_id INTEGER NOT NULL,
+        name VARCHAR(255) NOT NULL,
+        price DECIMAL(10, 2) NOT NULL,
+        category VARCHAR(100) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    console.log('✅ Menu table ready');
+
+    // Create indexes
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_customers_phone ON customers(phone)');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_orders_timestamp ON orders(timestamp DESC)');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_orders_phone ON orders(phone)');
+    console.log('✅ Database indexes created');
+
+    console.log('📊 PostgreSQL database initialized successfully');
+  } catch (err) {
+    console.error('❌ Database initialization error:', err.message);
+  }
+};
+
+// Initialize database on startup
+initializeDatabase();
+
+// ========================
+// PHONE NORMALIZATION
+// ========================
+// ========================
+// TIMESTAMP FORMATTING - IST (UTC+5:30)
+// ========================
+const getISTTimestamp = () => {
+  const now = new Date();
+  // Convert to IST (UTC+5:30)
+  const istTime = new Date(now.getTime() + (5.5 * 60 * 60 * 1000) - (5.5 * 60 * 60 * 1000) + (5.5 * 60 * 60 * 1000));
+  
+  // Return ISO string for database
+  const date = new Date(now.getTime() + (5.5 * 60 * 60 * 1000) - now.getTimezoneOffset() * 60 * 1000);
+  return date.toISOString();
+};
+
+// ========================
+// PHONE NORMALIZATION
+// ========================
+const normalizePhone = (phone) => {
+  // Remove WhatsApp JID suffixes and clean up phone number
+  if (!phone) return '';
+  
+  // Remove all WhatsApp suffixes (@s.whatsapp.net, @lid, @g.us, etc)
+  let cleaned = phone.replace(/@s\.whatsapp\.net$/, '')
+                     .replace(/@lid$/, '')
+                     .replace(/@g\.us$/, '')
+                     .replace(/\s+/g, '')  // Remove any whitespace
+                     .trim();
+  
+  // If somehow it still has @, remove everything after it
+  if (cleaned.includes('@')) {
+    cleaned = cleaned.split('@')[0];
+  }
+  
+  // Ensure it's only digits
+  cleaned = cleaned.replace(/\D/g, '');
+  
+  // Only keep if it's 10 digits (without country code) or 12+ digits (with country code)
+  if (cleaned.length >= 10) {
+    return cleaned;
+  }
+  
+  console.log(`⚠️ Invalid phone after normalization: ${phone} -> ${cleaned}`);
+  return null;
+};
+
+// ========================
+// FETCH CUSTOMER DETAILS FROM DATABASE
+// ========================
+const getCustomerDetails = async (phone) => {
+  const normalizedPhone = normalizePhone(phone);
+  
+  if (!normalizedPhone) {
+    console.log(`❌ Phone normalization failed for: ${phone}`);
+    return {
+      name: 'Customer',
+      phone: normalizedPhone || phone,
+      address: null
+    };
+  }
+  
+  console.log(`🔍 Looking up customer: ${normalizedPhone}`);
+  
+  try {
+    const result = await pool.query(
+      'SELECT name, phone, address FROM customers WHERE phone = $1',
+      [normalizedPhone]
+    );
+    
+    if (result.rows.length > 0) {
+      const customer = result.rows[0];
+      console.log(`✅ Customer found: ${customer.name} (${customer.phone})`);
+      return customer;
+    }
+    
+    console.log(`⚠️ Customer NOT found in database for: ${normalizedPhone}`);
+    // Return defaults if customer not found
+    return {
+      name: 'Customer',
+      phone: normalizedPhone,
+      address: null
+    };
+  } catch (error) {
+    console.error('❌ Database error getting customer:', error.message);
+    return {
+      name: 'Customer',
+      phone: normalizedPhone,
+      address: null
+    };
+  }
 };
 
 // ========================
@@ -511,26 +646,47 @@ const handleOrderMoreResponse = async (from, text, customerName) => {
 
     const totalPrice = cart.reduce((sum, item) => sum + item.lineTotal, 0);
     const itemsJSON = JSON.stringify(cart);
-    const timestamp = new Date().toISOString();
+    
+    // ✅ USE IST TIMESTAMP INSTEAD OF UTC
+    const timestamp = getISTTimestamp();
+    console.log(`⏰ Timestamp (IST): ${timestamp}`);
 
-    console.log(`📝 Processing order for ${customerName}: ${JSON.stringify(cart.map(c => c.name))}`);
+    // ✅ Normalize phone number
+    const normalizedPhone = normalizePhone(from);
+    console.log(`📝 Processing order for: ${normalizedPhone}`);
+    console.log(`📦 Items: ${JSON.stringify(cart.map(c => c.name))}`);
+
+    // ✅ Fetch fresh customer data FIRST (before database operations)
+    let customerDetails = await getCustomerDetails(from);
+    console.log(`📦 Customer lookup result: name="${customerDetails.name}", phone="${customerDetails.phone}"`);
 
     // Save to database
-    db.run(
-      'INSERT INTO orders (timestamp, name, phone, items, total_price) VALUES (?, ?, ?, ?, ?)',
-      [timestamp, customerName, from, itemsJSON, totalPrice],
-      (err) => {
-        if (err) {
-          console.error(`❌ Database error for ${from}:`, err.message);
-        } else {
-          console.log(`✅ Order saved to database for ${customerName}: ₹${totalPrice}`);
-        }
-      }
-    );
+    try {
+      // Step 1: Insert or update customer (to satisfy foreign key constraint)
+      await pool.query(
+        `INSERT INTO customers (phone, name, created_at, updated_at) 
+         VALUES ($1, $2, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+         ON CONFLICT (phone) DO UPDATE SET name = $2, updated_at = CURRENT_TIMESTAMP`,
+        [customerDetails.phone, customerDetails.name]
+      );
+      console.log(`✅ Customer saved: ${customerDetails.name} (${customerDetails.phone})`);
 
-    // Save to CSV
+      // Step 2: Insert order with customer details
+      const result = await pool.query(
+        'INSERT INTO orders (timestamp, name, phone, items, total_price, status) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id',
+        [timestamp, customerDetails.name, customerDetails.phone, itemsJSON, totalPrice, 'pending']
+      );
+      console.log(`✅ Order saved: ID=${result.rows[0].id}, Amount=₹${totalPrice}`);
+    } catch (error) {
+      console.error(`❌ Database error:`, error.message);
+      await sock.sendMessage(from, { text: '❌ Error processing order. Please try again.' });
+      return;
+    }
+
+    // ✅ Save to CSV with customer details
     const cartSummary = cart.map(item => `${item.name}(${item.quantity})`).join(', ');
-    saveOrderToCSV(timestamp, customerName, from, cartSummary, totalPrice);
+    saveOrderToCSV(timestamp, customerDetails.name, customerDetails.phone, cartSummary, totalPrice);
+    console.log(`✅ CSV saved`);
 
     // Send order confirmation
     const cartDetails = cart.map(item => 
@@ -540,26 +696,27 @@ const handleOrderMoreResponse = async (from, text, customerName) => {
     const confirmationMessage = `✅ *ORDER CONFIRMED!*\n\n📦 *Items:*\n${cartDetails}\n\n💰 *Total: ₹${totalPrice}*\n\n💳 *Payment Details:*\nPay below UPI Number - *9373332785*\n\nThank you for your order! 🙏`;
     
     await sock.sendMessage(from, { text: confirmationMessage });
-    console.log(`📤 Confirmation message sent to ${from}`);
+    console.log(`📤 Confirmation sent`);
 
-    // Emit to frontend
+    // ✅ Emit to frontend with correct customer data
     io.emit('newOrder', {
       timestamp,
-      name: customerName,
-      phone: from,
+      name: customerDetails.name,
+      phone: customerDetails.phone,
       items: cartSummary,
       total: totalPrice
     });
+    console.log(`📡 Frontend notified`);
 
     // Clear session
     userCart.delete(from);
     userSelectedItems.delete(from);
     userOrderingSession.delete(from);
 
-    console.log(`🎉 Order confirmed for ${customerName}: ${cartSummary} = ₹${totalPrice}`);
+    console.log(`🎉 Complete: ${customerDetails.name} - ${cartSummary} = ₹${totalPrice}`);
   } else {
     // Ignore invalid yes/no responses - wait for valid input
-    console.log(`⚠️ Invalid yes/no response from ${from}: "${text}" (will wait for valid yes/no response)`);
+    console.log(`⚠️ Invalid yes/no response from ${from}: "${text}"`);
   }
 };
 
@@ -568,15 +725,17 @@ const handleOrderMoreResponse = async (from, text, customerName) => {
 // ========================
 
 const getCustomerName = async (phone) => {
-  return new Promise((resolve) => {
-    db.get('SELECT name FROM customers WHERE phone = ?', [phone], (err, row) => {
-      if (row) {
-        resolve(row.name);
-      } else {
-        resolve('Customer');
-      }
-    });
-  });
+  const normalizedPhone = normalizePhone(phone);
+  try {
+    const result = await pool.query(
+      'SELECT name FROM customers WHERE phone = $1',
+      [normalizedPhone]
+    );
+    return result.rows.length > 0 ? result.rows[0].name : 'Customer';
+  } catch (error) {
+    console.error('❌ Error getting customer name:', error.message);
+    return 'Customer';
+  }
 };
 
 const saveOrderToCSV = (timestamp, name, phone, items, total) => {
@@ -671,88 +830,110 @@ app.get('/api/status', (req, res) => {
   });
 });
 
-app.get('/api/orders', (req, res) => {
-  db.all('SELECT * FROM orders ORDER BY timestamp DESC', (err, rows) => {
-    if (err) {
-      res.status(500).json({ error: err.message });
-    } else {
-      res.json(rows || []);
-    }
-  });
+app.get('/api/orders', async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT id, timestamp, name, phone, items, total_price, status FROM orders ORDER BY timestamp DESC'
+    );
+    const orders = result.rows.map(order => ({
+      ...order,
+      items: typeof order.items === 'string' ? order.items : JSON.stringify(order.items)
+    }));
+    res.json(orders);
+  } catch (error) {
+    console.error('❌ Error fetching orders:', error.message);
+    res.status(500).json({ error: error.message });
+  }
 });
 
 app.get('/api/menu', (req, res) => {
   res.json(Object.values(COMPLETE_MENU));
 });
 
-app.post('/api/customers', (req, res) => {
-  const { phone, name, address } = req.body;
+app.post('/api/customers', async (req, res) => {
+  let { phone, name, address } = req.body;
   
   if (!phone || !name) {
     return res.status(400).json({ error: 'Phone and name are required' });
   }
 
-  db.run('INSERT OR REPLACE INTO customers (phone, name, address) VALUES (?, ?, ?)',
-    [phone, name, address || ''],
-    (err) => {
-      if (err) {
-        res.status(500).json({ error: err.message });
-      } else {
-        res.json({ success: true, message: 'Customer added' });
-      }
-    }
-  );
+  // ✅ NEW: Normalize phone number
+  const normalizedPhone = normalizePhone(phone);
+
+  try {
+    await pool.query(
+      'INSERT INTO customers (phone, name, address) VALUES ($1, $2, $3) ON CONFLICT (phone) DO UPDATE SET name = $2, address = $3',
+      [normalizedPhone, name, address || null]
+    );
+    res.json({ success: true, message: 'Customer added', phone: normalizedPhone });
+  } catch (error) {
+    console.error('❌ Error adding customer:', error.message);
+    res.status(500).json({ error: error.message });
+  }
 });
 
-app.get('/api/customers', (req, res) => {
-  db.all('SELECT * FROM customers', (err, rows) => {
-    if (err) {
-      res.status(500).json({ error: err.message });
-    } else {
-      res.json(rows || []);
-    }
-  });
+app.get('/api/customers', async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT id, phone, name, address, created_at FROM customers ORDER BY created_at DESC'
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error('❌ Error fetching customers:', error.message);
+    res.status(500).json({ error: error.message });
+  }
 });
 
-app.delete('/api/customers/:phone', (req, res) => {
+app.delete('/api/customers/:phone', async (req, res) => {
   let { phone } = req.params;
   phone = decodeURIComponent(phone);
   
-  if (!phone) {
+  // ✅ NEW: Normalize phone number
+  const normalizedPhone = normalizePhone(phone);
+
+  if (!normalizedPhone) {
     return res.status(400).json({ error: 'Phone number is required' });
   }
 
-  db.run('DELETE FROM customers WHERE phone = ?', [phone], function(err) {
-    if (err) {
-      console.error('❌ Delete error:', err.message);
-      res.status(500).json({ error: err.message });
-    } else if (this.changes === 0) {
-      res.status(404).json({ error: 'Customer not found' });
-    } else {
-      console.log(`✅ Customer deleted: ${phone}`);
-      res.json({ success: true, message: 'Customer deleted', changes: this.changes });
+  try {
+    const result = await pool.query(
+      'DELETE FROM customers WHERE phone = $1',
+      [normalizedPhone]
+    );
+    
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'Customer not found' });
     }
-  });
+    
+    console.log(`✅ Customer deleted: ${normalizedPhone}`);
+    res.json({ success: true, message: 'Customer deleted', changes: result.rowCount });
+  } catch (error) {
+    console.error('❌ Delete error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
 });
 
-app.get('/api/orders/export', (req, res) => {
-  db.all('SELECT * FROM orders ORDER BY timestamp DESC', (err, rows) => {
-    if (err) {
-      res.status(500).json({ error: err.message });
-    } else {
-      const csv = generateCSV(rows);
-      res.setHeader('Content-Type', 'text/csv');
-      res.setHeader('Content-Disposition', 'attachment; filename="orders.csv"');
-      res.send(csv);
-    }
-  });
+app.get('/api/orders/export', async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT id, timestamp, name, phone, items, total_price, status FROM orders ORDER BY timestamp DESC'
+    );
+    const csv = generateCSV(result.rows);
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', 'attachment; filename="orders.csv"');
+    res.send(csv);
+  } catch (error) {
+    console.error('❌ Error exporting CSV:', error.message);
+    res.status(500).json({ error: error.message });
+  }
 });
 
 const generateCSV = (orders) => {
   let csv = 'Timestamp,Name,Phone,Items,Total Price,Status\n';
   orders.forEach(order => {
-    const items = order.items.replace(/"/g, '""'); // Escape quotes for CSV
-    csv += `"${order.timestamp}","${order.name}","${order.phone}","${items}",${order.total_price},"${order.status}"\n`;
+    const items = typeof order.items === 'string' ? order.items : JSON.stringify(order.items);
+    const itemsEscaped = items.replace(/"/g, '""'); // Escape quotes for CSV
+    csv += `"${order.timestamp}","${order.name}","${order.phone}","${itemsEscaped}",${order.total_price},"${order.status}"\n`;
   });
   return csv;
 };
@@ -774,8 +955,12 @@ server.listen(PORT, async () => {
 });
 
 process.on('SIGINT', () => {
-  console.log('Shutting down gracefully...');
-  db.close();
-  server.close();
-  process.exit(0);
+  console.log('\n⏹️ Shutting down gracefully...');
+  pool.end(() => {
+    console.log('✅ PostgreSQL connection pool closed');
+    server.close(() => {
+      console.log('✅ Server closed');
+      process.exit(0);
+    });
+  });
 });
