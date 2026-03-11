@@ -68,7 +68,7 @@ swasth-order-agent/
 
 ```bash
 # Create PostgreSQL user and database
-psql -U postgres -c "CREATE USER swasth WITH PASSWORD 'swasth111';"
+psql -U postgres -c "CREATE USER swasth WITH PASSWORD 'password';"
 psql -U postgres -c "CREATE DATABASE swasth_cafe OWNER swasth;"
 ```
 
@@ -349,7 +349,7 @@ DB_HOST=localhost
 DB_PORT=5432
 DB_NAME=swasth_cafe
 DB_USER=swasth
-DB_PASSWORD=swasth111
+DB_PASSWORD=password
 
 # ========================
 # SERVER CONFIG
