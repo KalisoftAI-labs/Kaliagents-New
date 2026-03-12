@@ -106,6 +106,13 @@ const CustomerManagement = ({ customers, onAddCustomer, onRefresh, apiUrl = 'htt
       <div className="card-modern" style={{ gridColumn: 'span 2', maxWidth: '100%' }}>
         <div className="flex-between mb-6 pb-4" style={{ borderBottom: '1px solid var(--text-200)' }}>
           <h3 className="h3 mb-0">👥 Customers <span className="badge badge-primary">{customers.length}</span></h3>
+          <button
+            onClick={() => { window.location.href = `${apiUrl}/api/customers/export`; }}
+            className="btn-modern btn-secondary btn-small"
+            title="Download WhatsApp contacts as CSV (plain name + number)"
+          >
+            📥 Download Contacts CSV
+          </button>
         </div>
         
         {customers.length === 0 ? (

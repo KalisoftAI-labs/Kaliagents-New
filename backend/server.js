@@ -13,7 +13,7 @@ const pino = require('pino');
 const { createWriteStream } = require('fs');
 const { format } = require('fast-csv');
 
-require('dotenv').config();
+require('dotenv').config({ path: require('path').join(__dirname, '.env') });
 
 const app = express();
 const server = http.createServer(app);
@@ -53,34 +53,50 @@ const COMPLETE_MENU = {
   15: { id: 15, name: 'Paneer + sprout salad', price: 85, category: 'Salads' }
 };
 
-const generateMenuMessage = () => {
-  return `🍽️ *SWASTH CAFE MENU* 🍽️
+const generateMenuMessage = (cart = null) => {
+  // Build cart summary line if cart exists
+  let cartLine = '';
+  if (cart && cart.length > 0) {
+    const total = cart.reduce((s, i) => s + i.lineTotal, 0);
+    const names = cart.map(i => `${i.name.split(' ')[0]}×${i.quantity}`).join(', ');
+    cartLine = `\n🛒 _Cart: ${names} — ₹${total}_\n`;
+  }
 
-*🥤 JUICES*
-1️⃣ Amla juice – 25/-
-2️⃣ Beetroot juice – 25/-
-3️⃣ Carrot juice – 25/-
-4️⃣ Karela juice – 25/-
-5️⃣ Palak juice – 25/-
-6️⃣ Ash gourd juice – 25/-
-
-*🥛 MIX JUICES*
-7️⃣ ABC Juice – 25/-
-8️⃣ Amla + Karela juice – 25/-
-9️⃣ Beetroot + Carrot juice – 25/-
-🔟 Amla + Palak – 25/-
-
-*💧 DETOX WATERS*
-1️⃣1️⃣ Liver cleanser detox – 10/-
-1️⃣2️⃣ Beauty boost detox – 15/-
-1️⃣3️⃣ Digestive boost kanji water – 15/-
-
-*🥗 SALADS*
-1️⃣4️⃣ Mix sprouts salad – 40/-
-1️⃣5️⃣ Paneer + sprout salad – 85/-
-
-📝 *Reply with item numbers separated by commas*
-Example: 1,2,3,12,10`;
+  return `🌿 *SWASTH CAFE — Order Menu*${cartLine}
+━━━━━━━━━━━━━━━━━━━━
+🥤 *JUICES* · ₹25 each
+┌──────────────────────
+│ *1* Amla juice
+│ *2* Beetroot juice
+│ *3* Carrot juice
+│ *4* Karela juice
+│ *5* Palak juice
+│ *6* Ash gourd juice
+└──────────────────────
+🥛 *MIX JUICES* · ₹25 each
+┌──────────────────────
+│ *7*  ABC Juice
+│ *8*  Amla + Karela
+│ *9*  Beet + Carrot
+│ *10* Amla + Palak
+└──────────────────────
+💧 *DETOX WATERS*
+┌──────────────────────
+│ *11* Liver Cleanser · ₹10
+│ *12* Beauty Boost · ₹15
+│ *13* Kanji Water · ₹15
+└──────────────────────
+🥗 *SALADS*
+┌──────────────────────
+│ *14* Mix Sprouts Salad · ₹40
+│ *15* Paneer+Sprout Salad · ₹85
+└──────────────────────
+*Just send the item number(s) to order:*
+  ✏️  *3* → Carrot juice
+  ✏️  *1,5,12* → pick multiple items
+  ✏️  *CART* → view your cart
+  ✏️  *DONE* → confirm & place order
+  ✏️  *CLEAR* → 🗑 start over`;
 };
 
 // ========================
@@ -111,13 +127,16 @@ const initializeDatabase = async () => {
     await pool.query(`
       CREATE TABLE IF NOT EXISTS customers (
         id SERIAL PRIMARY KEY,
-        phone VARCHAR(20) UNIQUE NOT NULL,
+        phone VARCHAR(30) UNIQUE NOT NULL,
         name VARCHAR(255) NOT NULL,
         address TEXT,
+        whatsapp_jid VARCHAR(60),
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
+    // Add whatsapp_jid column to existing tables that predate this migration
+    await pool.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS whatsapp_jid VARCHAR(60)`);
     console.log('✅ Customers table ready');
 
     // Create orders table
@@ -149,12 +168,76 @@ const initializeDatabase = async () => {
     `);
     console.log('✅ Menu table ready');
 
+    // Create chat_logs table (stores every message sent/received per user)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS chat_logs (
+        id SERIAL PRIMARY KEY,
+        phone VARCHAR(20) NOT NULL,
+        customer_name VARCHAR(255) DEFAULT 'Unknown',
+        direction VARCHAR(10) NOT NULL,
+        message TEXT NOT NULL,
+        session_date DATE DEFAULT CURRENT_DATE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    console.log('✅ Chat logs table ready');
+
+    // Create whatsapp_contacts view (clean name + phone, no encoding/lid)
+    await pool.query(`
+      CREATE OR REPLACE VIEW whatsapp_contacts AS
+      SELECT
+        id,
+        name,
+        phone,
+        address,
+        created_at
+      FROM customers
+      ORDER BY name ASC
+    `);
+    console.log('✅ WhatsApp contacts view ready');
+
     // Create indexes
     await pool.query('CREATE INDEX IF NOT EXISTS idx_customers_phone ON customers(phone)');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_customers_jid ON customers(whatsapp_jid)');
     await pool.query('CREATE INDEX IF NOT EXISTS idx_orders_timestamp ON orders(timestamp DESC)');
     await pool.query('CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)');
     await pool.query('CREATE INDEX IF NOT EXISTS idx_orders_phone ON orders(phone)');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_chat_logs_phone ON chat_logs(phone)');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_chat_logs_created ON chat_logs(created_at DESC)');
     console.log('✅ Database indexes created');
+
+    // ── Dedup migration ──────────────────────────────────────────────────────
+    // If the same person has two rows (one with real phone, one from LID auto-save)
+    // keep the real-phone row and re-link any orders that pointed at the LID row.
+    // A "LID row" is one where phone is 15 digits (WhatsApp internal ID, not a real number).
+    try {
+      const dupRes = await pool.query(`
+        SELECT a.phone AS real_phone, b.phone AS lid_phone, a.name
+        FROM customers a
+        JOIN customers b
+          ON a.name = b.name
+          AND a.phone <> b.phone
+          AND length(b.phone) = 15
+          AND length(a.phone) <> 15
+      `);
+      for (const row of dupRes.rows) {
+        // Re-point orders from LID phone → real phone
+        await pool.query(
+          `UPDATE orders SET phone = $1 WHERE phone = $2`,
+          [row.real_phone, row.lid_phone]
+        );
+        // Store LID phone as whatsapp_jid on the real customer row
+        await pool.query(
+          `UPDATE customers SET whatsapp_jid = $1 WHERE phone = $2`,
+          [row.lid_phone + '@lid', row.real_phone]
+        );
+        // Remove the duplicate LID row
+        await pool.query(`DELETE FROM customers WHERE phone = $1`, [row.lid_phone]);
+        console.log(`🔀 Merged duplicate: ${row.name} — LID ${row.lid_phone} → real ${row.real_phone}`);
+      }
+    } catch (e) {
+      console.warn('⚠️ Dedup migration skipped:', e.message);
+    }
 
     console.log('📊 PostgreSQL database initialized successfully');
   } catch (err) {
@@ -216,63 +299,83 @@ const normalizePhone = (phone) => {
 // FETCH CUSTOMER DETAILS FROM DATABASE
 // ========================
 const getCustomerDetails = async (phone) => {
-  const normalizedPhone = normalizePhone(phone);
-  
-  if (!normalizedPhone) {
-    console.log(`❌ Phone normalization failed for: ${phone}`);
-    return {
-      name: 'Customer',
-      phone: normalizedPhone || phone,
-      address: null
-    };
+  // Session cache hit — real phone already resolved
+  const session = userOrderingSession.get(phone);
+  if (session?.customerPhone) {
+    return { name: session.customerName || 'Customer', phone: session.customerPhone, address: session.customerAddress || null };
   }
-  
-  console.log(`🔍 Looking up customer: ${normalizedPhone}`);
-  
+
+  const normalizedPhone = normalizePhone(phone);
+  const rawJid = phone;
+
   try {
-    const result = await pool.query(
-      'SELECT name, phone, address FROM customers WHERE phone = $1',
-      [normalizedPhone]
-    );
-    
-    if (result.rows.length > 0) {
-      const customer = result.rows[0];
-      console.log(`✅ Customer found: ${customer.name} (${customer.phone})`);
-      return customer;
+    // ── 1. Look up by whatsapp_jid ──
+    if (rawJid && rawJid.includes('@')) {
+      const jidRes = await pool.query(
+        'SELECT name, phone, address FROM customers WHERE whatsapp_jid = $1',
+        [rawJid]
+      );
+      if (jidRes.rows.length > 0) {
+        const c = jidRes.rows[0];
+        if (session) { session.customerName = c.name; session.customerPhone = c.phone; session.customerAddress = c.address; }
+        return c;
+      }
     }
-    
-    console.log(`⚠️ Customer NOT found in database for: ${normalizedPhone}`);
-    // Return defaults if customer not found
-    return {
-      name: 'Customer',
-      phone: normalizedPhone,
-      address: null
-    };
+
+    // ── 2. Fall back to normalized phone ──
+    if (normalizedPhone) {
+      const phoneRes = await pool.query(
+        'SELECT name, phone, address FROM customers WHERE phone = $1',
+        [normalizedPhone]
+      );
+      if (phoneRes.rows.length > 0) {
+        const c = phoneRes.rows[0];
+        if (session) { session.customerName = c.name; session.customerPhone = c.phone; session.customerAddress = c.address; }
+        return c;
+      }
+    }
   } catch (error) {
     console.error('❌ Database error getting customer:', error.message);
-    return {
-      name: 'Customer',
-      phone: normalizedPhone,
-      address: null
-    };
   }
+
+  // Not found — return fallback using real normalized phone
+  return { name: 'Customer', phone: normalizedPhone || phone, address: null };
 };
 
 // ========================
 // STATE MANAGEMENT
 // ========================
 const userCart = new Map();              // Maps phone -> [{id, name, price, qty}, ...]
-const userOrderingSession = new Map();   // Maps phone -> { state: 'awaiting_items'|'awaiting_qty'|'awaiting_more'|'awaiting_qty_for_item_X' }
+const userOrderingSession = new Map();   // Maps phone -> { state: 'ordering' } + cached customerName/phone/address
 const userSelectedItems = new Map();     // Maps phone -> [1,2,3,12] (item IDs)
 const processedMessages = new Map();     // Maps messageId -> timestamp (prevents duplicate processing)
 const userLastMessage = new Map();       // Maps phone -> { id, text, timestamp } (detects rapid duplicates)
 let cronJobScheduled = false;            // Flag to prevent duplicate cron jobs
 
 // ========================
+// LID → JID RESOLUTION MAP
+// ========================
+// Baileys populates sock.contacts lazily. We build our own persistent map
+// from contacts events so LIDs can be resolved even after initial sync.
+const lidToJidMap = new Map(); // Maps '220331906232532@lid' → '919876543210@s.whatsapp.net'
+
+const updateLidMap = (contacts) => {
+  if (!Array.isArray(contacts)) contacts = Object.values(contacts);
+  let count = 0;
+  for (const c of contacts) {
+    if (c && c.lid && c.id && !c.id.endsWith('@lid')) {
+      lidToJidMap.set(c.lid, c.id);
+      count++;
+    }
+  }
+  if (count > 0) console.log(`🗂️  LID map updated: ${count} entries (total ${lidToJidMap.size})`);
+};
+
+// ========================
 // MESSAGE DEDUPLICATION
 // ========================
 const isMessageDuplicate = (from, messageId, text) => {
-  const DUPLICATE_THRESHOLD = 2000; // 2 seconds - consider duplicates within this window
+  const DUPLICATE_THRESHOLD = 3000; // 3 seconds — covers Baileys retry/reconnect replay windows
   const now = Date.now();
   
   // IMMEDIATELY mark message as processed to prevent race conditions
@@ -292,8 +395,8 @@ const isMessageDuplicate = (from, messageId, text) => {
     return true;
   }
   
-  // Clean up old entries (keep only last 100 messages)
-  if (processedMessages.size > 100) {
+  // Clean up old entries (keep only last 500 messages)
+  if (processedMessages.size > 500) {
     const oldestKey = processedMessages.keys().next().value;
     processedMessages.delete(oldestKey);
   }
@@ -308,12 +411,17 @@ const isMessageDuplicate = (from, messageId, text) => {
 // TIME MANAGEMENT
 // ========================
 const ORDERING_CONFIG = {
-  startTime: 9,    // 9:00 AM
-  endTime: 20,     // 8:00 PM
+  startTime: 9,    // 9:00 AM  (production)
+  endTime: 20,     // 8:00 PM  (production)
   timezone: 'IST'
 };
 
 const isOrderingAllowed = () => {
+  // TEST_MODE=true in .env bypasses time restriction for testing
+  if (process.env.TEST_MODE === 'true') {
+    console.log('⚠️  TEST_MODE ON — time restriction bypassed');
+    return true;
+  }
   const now = new Date();
   const currentHour = now.getHours();
   return currentHour >= ORDERING_CONFIG.startTime && currentHour < ORDERING_CONFIG.endTime;
@@ -322,41 +430,27 @@ const isOrderingAllowed = () => {
 const getOrderingClosedMessage = () => {
   const now = new Date();
   const currentHour = now.getHours();
-  
+  const timeStr = now.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true });
+
   if (currentHour >= ORDERING_CONFIG.endTime) {
-    return `🕙 *ORDERING TIME CLOSED* 🕙
+    return `🌙 *Swasth Cafe is Closed*
 
-Sorry, our ordering window has closed for today!
+Our kitchen has closed for today.
 
-⏰ *Ordering Hours:*
-🌅 9:00 AM - 8:00 PM (Daily)
+⏰ *Ordering Hours:* 9:00 AM – 8:00 PM
+🕐 *Current Time:* ${timeStr} IST
 
-🕐 Current Time: ${now.toLocaleTimeString('en-IN', { 
-  hour: '2-digit', 
-  minute: '2-digit',
-  hour12: true 
-})} ${ORDERING_CONFIG.timezone}
-
-📱 *You can place your order tomorrow from 9:00 AM onwards!*
-
-Thank you! 🙏`;
+See you tomorrow morning! 🌅
+_— Swasth Cafe_ 🙏`;
   } else {
-    return `🕙 *ORDERING NOT STARTED YET* 🕙
+    return `🌅 *Good Morning!*
 
-Good morning! Ordering is not available right now.
+Ordering opens at *9:00 AM* daily.
 
-⏰ *Ordering Hours:*
-🌅 9:00 AM - 8:00 PM (Daily)
+⏰ *Ordering Hours:* 9:00 AM – 8:00 PM
+🕐 *Current Time:* ${timeStr} IST
 
-🕐 Current Time: ${now.toLocaleTimeString('en-IN', { 
-  hour: '2-digit', 
-  minute: '2-digit',
-  hour12: true 
-})} ${ORDERING_CONFIG.timezone}
-
-📱 *Orders open at 9:00 AM! Come back soon!*
-
-Thank you! 🙏`;
+_Come back soon_ 🌿`;
   }
 };
 
@@ -421,10 +515,24 @@ const connectWhatsApp = async () => {
         connectionStatus = 'disconnected';
         io.emit('connectionStatus', { status: 'disconnected' });
         
-        const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-        
-        if (shouldReconnect) {
-          console.log('\n⚠️ Connection closed.');
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const loggedOut  = statusCode === DisconnectReason.loggedOut;
+
+        if (loggedOut) {
+          // Session expired / phone unlinked — wipe auth so a fresh QR is shown
+          console.log('\n🔒 WhatsApp session expired (401). Clearing auth and showing new QR...');
+          try {
+            const authPath = path.join(__dirname, 'auth');
+            const files = fs.readdirSync(authPath);
+            for (const f of files) fs.unlinkSync(path.join(authPath, f));
+            console.log(`🗑️  Auth cleared (${files.length} files removed)`);
+          } catch (e) {
+            console.warn('⚠️  Could not clear auth folder:', e.message);
+          }
+          console.log('🔄 Restarting WhatsApp in 3 seconds to show QR...\n');
+          setTimeout(() => connectWhatsApp(), 3000);
+        } else {
+          console.log(`\n⚠️ Connection closed (code ${statusCode}).`);
           console.log('🔄 Reconnecting in 5 seconds...\n');
           setTimeout(() => connectWhatsApp(), 5000);
         }
@@ -433,56 +541,168 @@ const connectWhatsApp = async () => {
 
     sock.ev.on('creds.update', saveCreds);
 
+    // ──────────────────────────────────────────────────────
+    // CONTACTS SYNC — builds our LID→JID map as WhatsApp
+    // delivers contact records (happens right after connect).
+    // This is the source-of-truth for resolving @lid JIDs.
+    // ──────────────────────────────────────────────────────
+    sock.ev.on('contacts.upsert', (contacts) => {
+      updateLidMap(contacts);
+    });
+
+    sock.ev.on('contacts.update', (updates) => {
+      updateLidMap(updates);
+    });
+
+    // Also seed the map from sock.contacts if it's already populated
+    // (happens on reconnect when auth state is restored)
+    setTimeout(() => {
+      if (sock.contacts && Object.keys(sock.contacts).length > 0) {
+        updateLidMap(sock.contacts);
+      }
+    }, 3000);
+
     sock.ev.on('messages.upsert', async (m) => {
+      if (m.type !== 'notify') return;
+
       try {
         const message = m.messages[0];
         if (!message.message) return;
+        if (message.key.fromMe) return; // Skip our own outgoing messages
 
-        const from = message.key.remoteJid;
+        let from = message.key.remoteJid;
         const messageId = message.key.id;
+        const pushName = message.pushName || null; // WhatsApp display name
+
+        // 🔄 Resolve LID (Linked Device Identity) to real phone JID.
+        // LIDs look like "220331906232532@lid".
+        //
+        // IMPORTANT: If we can't resolve the LID to a real JID, we KEEP
+        // the original @lid address for sending — WhatsApp routes replies
+        // to @lid just fine. Converting to a fake @s.whatsapp.net breaks
+        // sending because the LID number is not a real phone number.
+        //
+        // normalizePhone() already strips @lid for DB storage, so DB phone
+        // will be the numeric part (e.g. "220331906232532") regardless.
+        if (from && from.endsWith('@lid')) {
+          // --- attempt 1: our own persistent map (built from contacts events) ---
+          const resolvedFromMap = lidToJidMap.get(from);
+          if (resolvedFromMap) {
+            console.log(`🔄 LID resolved (map): ${from} → ${resolvedFromMap}`);
+            from = resolvedFromMap;
+          } else {
+            // --- attempt 2: sock.contacts (may be populated after initial sync) ---
+            const contacts = sock.contacts || {};
+            const resolvedFromContacts = Object.values(contacts).find(c =>
+              (c.lid === from || c.id === from) && c.id && !c.id.endsWith('@lid')
+            )?.id;
+
+            if (resolvedFromContacts) {
+              lidToJidMap.set(from, resolvedFromContacts);
+              console.log(`🔄 LID resolved (contacts): ${from} → ${resolvedFromContacts}`);
+              from = resolvedFromContacts;
+            } else {
+              // --- fallback: keep @lid as-is for routing, log it ---
+              console.log(`📱 LID unresolved — routing to ${from} directly (pushName: ${pushName || 'unknown'})`);
+              // 'from' stays as the original @lid JID — WhatsApp will route it
+            }
+          }
+        }
+
         const text = message.message.conversation || message.message.extendedTextMessage?.text;
-        
         if (!text) return;
 
         // Ignore whitespace-only messages
         if (text.trim().length === 0) return;
 
-        // Check for duplicate messages (prevents Baileys event duplication)
+        // Deduplicate — prevents Baileys from firing the same event multiple times
         if (isMessageDuplicate(from, messageId, text)) {
-          return; // Ignore duplicate message
-        }
-
-        console.log(`📨 Message from ${from}: "${text}"`);
-
-        // ✅ STEP 1: Check if ordering is allowed by time
-        if (!isOrderingAllowed()) {
-          await sock.sendMessage(from, { text: getOrderingClosedMessage() });
           return;
         }
 
-        // Get customer name
-        const customerName = await getCustomerName(from);
+        // Resolve customer name — pass pushName to auto-save unknown customers
+        const customerName = await getCustomerName(from, pushName);
+        console.log(`📨 [${customerName}] ${from}: "${text}"`);
+
+        // ✅ Log incoming
+        await logChatMessage(from, 'incoming', text, customerName);
+
+        // ✅ STEP 1: Check if ordering is allowed by time
+        if (!isOrderingAllowed()) {
+          await sendWAMessage(from, { text: getOrderingClosedMessage() }, customerName);
+          return;
+        }
 
         // ✅ STEP 2: Check if this is a NEW SESSION (first message from user)
         const isNewSession = !userOrderingSession.has(from);
-        
+
         if (isNewSession) {
-          // This is the customer's first message - send the menu
-          userOrderingSession.set(from, { state: 'awaiting_items' });
-          await sock.sendMessage(from, { text: generateMenuMessage() });
+          userOrderingSession.set(from, { state: 'ordering', customerName });
+          await sendWAMessage(from, { text: generateMenuMessage(null) }, customerName);
           return;
         }
 
         // Get existing session state
         let session = userOrderingSession.get(from);
 
-        // ✅ STEP 3: Handle different conversation states
-        if (session.state === 'awaiting_items') {
-          await handleItemSelection(from, text, customerName);
-        } else if (session.state === 'awaiting_qty') {
-          await handleQuantityInput(from, text, customerName);
-        } else if (session.state === 'awaiting_more') {
-          await handleOrderMoreResponse(from, text, customerName);
+        // ── STATE: qty_input ─────────────────────────────────────────────────
+        // Bot asked "how many?" — user is replying with quantities
+        if (session.state === 'qty_input') {
+          const cmd = text.trim().toLowerCase();
+
+          if (['back', 'menu'].includes(cmd)) {
+            // Cancel qty step, go back to menu
+            session.pendingItems = null;
+            session.state = 'ordering';
+            const currentCart = userCart.get(from) || [];
+            await sendWAMessage(from, { text: generateMenuMessage(currentCart.length ? currentCart : null) }, customerName);
+
+          } else if (['done', 'confirm', '✅', 'ok', 'yes'].includes(cmd)) {
+            // DONE during qty step — use qty 1 for all pending, then confirm
+            await applyQtyAndAddToCart(from, session, null);
+            await confirmOrder(from, customerName);
+
+          } else if (['clear', 'cancel', '❌'].includes(cmd)) {
+            userCart.delete(from);
+            session.pendingItems = null;
+            session.state = 'ordering';
+            userOrderingSession.set(from, session);
+            await sendWAMessage(from, { text: `🗑 *Cart cleared!*\n\n${generateMenuMessage(null)}` }, customerName);
+
+          } else {
+            // Parse qty reply: "2", "2 1 3", "1"
+            await applyQtyAndAddToCart(from, session, text);
+          }
+          return;
+        }
+
+        // ── STATE: ordering ──────────────────────────────────────────────────
+        if (session.state === 'ordering') {
+          const cmd = text.trim().toLowerCase();
+
+          if (['done', 'confirm', '✅', 'ok', 'yes'].includes(cmd)) {
+            await confirmOrder(from, customerName);
+
+          } else if (['clear', 'cancel', 'reset', 'restart', '❌', 'no'].includes(cmd)) {
+            userCart.delete(from);
+            userOrderingSession.set(from, { ...session, state: 'ordering' });
+            await sendWAMessage(from, { text: `🗑 *Cart cleared!*\n\n${generateMenuMessage(null)}` }, customerName);
+
+          } else if (cmd === 'menu') {
+            const currentCart = userCart.get(from) || [];
+            await sendWAMessage(from, { text: generateMenuMessage(currentCart.length ? currentCart : null) }, customerName);
+
+          } else if (cmd === 'cart') {
+            const currentCart = userCart.get(from);
+            if (!currentCart || currentCart.length === 0) {
+              await sendWAMessage(from, { text: `🛒 Your cart is empty.\n\nSend item numbers to add items.` }, customerName);
+            } else {
+              await sendWAMessage(from, { text: buildCartMessage(currentCart) }, customerName);
+            }
+
+          } else {
+            await handleItemSelection(from, text, customerName);
+          }
         }
 
       } catch (error) {
@@ -501,240 +721,395 @@ const connectWhatsApp = async () => {
 // MESSAGE HANDLERS
 // ========================
 
-// Input validation - ensures text is in proper format "1,2,3" not menu garbage
-const isValidItemSelectionInput = (text) => {
-  // Only allow numbers, commas, spaces, and hyphens
-  const cleanInput = text.trim();
-  
-  // Reject if contains common menu words
-  const menuKeywords = ['juice', 'detox', 'salad', 'water', 'menu', 'amla', 'beetroot', 'carrot', 'palak', 'kanji', 'sprout', 'paneer'];
-  const lowerText = cleanInput.toLowerCase();
-  if (menuKeywords.some(keyword => lowerText.includes(keyword))) {
-    return false;
+// Parse order input.
+// In ordering state only item numbers are accepted (no inline qty).
+// Qty is collected conversationally in the qty_input state.
+// Formats:
+//   "3"       → select item 3
+//   "1,3,12"  → select items 1, 3 and 12
+//   "1 3"     → same with spaces
+//   "remove 3" / "del 3" → remove item 3 from cart
+// Returns { type: 'select'|'remove', items: [{itemId}] } or null
+const parseOrderInput = (text) => {
+  const clean = text.trim();
+
+  // ── REMOVE: "remove N" or "del N" ─────────────────────────────────
+  const removeMatch = clean.match(/^(?:remove|del|delete)\s+(\d{1,2})$/i);
+  if (removeMatch) {
+    const itemId = parseInt(removeMatch[1]);
+    if (!COMPLETE_MENU[itemId]) return null;
+    return { type: 'remove', items: [{ itemId }] };
   }
-  
-  // Check if input only contains numbers, commas, and spaces
-  const validPattern = /^[0-9, ]+$/;
-  if (!validPattern.test(cleanInput)) {
-    return false;
+
+  // ── SELECT item numbers ───────────────────────────────────────
+  const menuKeywords = ['juice', 'detox', 'salad', 'water', 'amla', 'beetroot', 'carrot',
+                        'palak', 'kanji', 'sprout', 'paneer', 'swasth', 'cafe'];
+  if (menuKeywords.some(k => clean.toLowerCase().includes(k))) return null;
+
+  // Only digits, commas, spaces
+  if (!/^[0-9,\s]+$/.test(clean)) return null;
+
+  const entries = clean.split(/[,\s]+/).map(s => s.trim()).filter(Boolean);
+  if (entries.length === 0 || entries.length > 8) return null;
+
+  const items = [];
+  const seen  = new Set();
+  for (const entry of entries) {
+    const itemId = parseInt(entry);
+    if (isNaN(itemId) || !COMPLETE_MENU[itemId]) return null;
+    if (seen.has(itemId)) continue; // de-duplicate selections
+    seen.add(itemId);
+    items.push({ itemId });
   }
-  
-  // Extract numbers and check count
-  const numbers = cleanInput.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
-  
-  // Reject if too many items at once (more than 7)
-  if (numbers.length > 7) {
-    return false;
-  }
-  
-  // Reject if empty
-  if (numbers.length === 0) {
-    return false;
-  }
-  
-  return true;
+  if (items.length === 0) return null;
+
+  return { type: 'select', items };
 };
 
-// Step 1: Handle item selection (e.g., "1,2,3,12,10")
-const handleItemSelection = async (from, text, customerName) => {
-  // Validate input format first
-  if (!isValidItemSelectionInput(text)) {
-    // Silently ignore invalid input - don't send error messages
-    console.log(`⚠️ Invalid item selection from ${from}: "${text}"`);
+// Apply qty reply from user and add items to cart.
+// qtyText: space-separated numbers e.g. "2 1 3", or null/"1" for qty 1 all.
+const applyQtyAndAddToCart = async (from, session, qtyText) => {
+  const pending = session.pendingItems || [];
+  if (pending.length === 0) {
+    session.state = 'ordering';
     return;
   }
 
-  const itemNumbers = text.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
-
-  // Validate all items exist
-  const invalidItems = itemNumbers.filter(num => !COMPLETE_MENU[num]);
-  if (invalidItems.length > 0) {
-    console.log(`⚠️ Invalid item numbers from ${from}: ${invalidItems.join(', ')}`);
-    return;
+  let qtys = [];
+  if (qtyText) {
+    qtys = qtyText.trim().split(/\s+/).map(n => parseInt(n)).filter(n => !isNaN(n) && n >= 1 && n <= 20);
   }
 
-  // Store selected items
-  userSelectedItems.set(from, itemNumbers);
-  
-  // Ask for quantities
-  const itemsList = itemNumbers.map(id => `${id}. ${COMPLETE_MENU[id].name}`).join('\n');
-  
-  await sock.sendMessage(from, {
-    text: `✅ Great! You selected:\n\n${itemsList}\n\n📦 Now, please reply with quantities for each item (in same order).\nExample: 1,2,3,1,2`
-  });
+  // If user gave a single number, apply it to all pending items
+  // If user gave one number per item, apply in order
+  // Otherwise default to 1
+  const getQty = (i) => {
+    if (qtys.length === 0)          return 1;
+    if (qtys.length === 1)          return qtys[0];  // one number = same qty for all
+    return qtys[i] !== undefined ? qtys[i] : 1;
+  };
 
-  // Update session state
-  userOrderingSession.set(from, { state: 'awaiting_qty' });
-  console.log(`📋 User ${from} selected items: ${itemNumbers.join(',')}`);
-};
-
-// Step 2: Handle quantity input
-const handleQuantityInput = async (from, text, customerName) => {
-  const selectedItems = userSelectedItems.get(from);
-  if (!selectedItems) {
-    await sock.sendMessage(from, { text: generateMenuMessage() });
-    userOrderingSession.set(from, { state: 'awaiting_items' });
-    return;
-  }
-
-  const quantities = text.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n) && n > 0);
-  
-  // Validate quantity count - silently ignore if wrong
-  if (quantities.length !== selectedItems.length) {
-    console.log(`⚠️ Invalid quantity count from ${from}: expected ${selectedItems.length}, got ${quantities.length}`);
-    return;
-  }
-
-  // Build new items from this selection
-  const newItems = selectedItems.map((itemId, idx) => ({
-    ...COMPLETE_MENU[itemId],
-    quantity: quantities[idx],
-    lineTotal: COMPLETE_MENU[itemId].price * quantities[idx]
+  const existingCart = userCart.get(from) || [];
+  const newItems = pending.map((p, i) => ({
+    ...COMPLETE_MENU[p.itemId],
+    quantity:  getQty(i),
+    lineTotal: COMPLETE_MENU[p.itemId].price * getQty(i)
   }));
 
-  // Get existing cart (if any) or start fresh - APPEND new items!
-  const existingCart = userCart.get(from) || [];
-  const updatedCart = [...existingCart, ...newItems];
-  
+  // Replace existing qty if item already in cart (re-order = update qty)
+  const incoming = new Map(newItems.map(item => [item.id, item]));
+  const kept = existingCart.filter(i => !incoming.has(i.id));
+  const updatedCart = mergeCartItems([...kept, ...incoming.values()]);
+
   userCart.set(from, updatedCart);
-  console.log(`🛒 Cart updated for ${from}: ${updatedCart.length} total items (added ${newItems.length} new items)`);
+  session.pendingItems = null;
+  session.state = 'ordering';
+  userOrderingSession.set(from, session);
 
-  // Calculate total
-  const totalPrice = updatedCart.reduce((sum, item) => sum + item.lineTotal, 0);
-
-  // Ask if they want to order more
-  const cartSummary = updatedCart.map(item => 
-    `${item.id}. ${item.name} x${item.quantity} = ₹${item.lineTotal}`
-  ).join('\n');
-
-  const moreItemsMessage = `📦 *YOUR CART:*\n\n${cartSummary}\n\n💰 *Total: ₹${totalPrice}*\n\n❓ Do you want to order more items?\nReply: *Yes* or *No*`;
-  
-  await sock.sendMessage(from, { text: moreItemsMessage });
-  console.log(`📤 "More items?" message sent to ${from}`);
-
-  userOrderingSession.set(from, { state: 'awaiting_more' });
-  console.log(`💳 User ${from} cart total: ₹${totalPrice}`);
+  const customerName = session.customerName || 'Customer';
+  await sendWAMessage(from, { text: buildCartMessage(updatedCart) }, customerName);
+  const total = updatedCart.reduce((s, i) => s + i.lineTotal, 0);
+  console.log(`🛒 Cart updated for ${from}: ₹${total}`);
 };
 
-// Step 3: Handle "Order More?" response
-const handleOrderMoreResponse = async (from, text, customerName) => {
-  const response = text.trim().toLowerCase();
-  console.log(`📨 Handling "order more" response from ${from}: "${response}"`);
-
-  if (response === 'yes' || response === 'y') {
-    // IMPORTANT: Keep existing cart, only reset item selection
-    // Do NOT delete userCart - we need to preserve it for final total!
-    userSelectedItems.delete(from);
-    userOrderingSession.set(from, { state: 'awaiting_items' });
-    
-    const currentCart = userCart.get(from);
-    const currentCartTotal = currentCart ? currentCart.reduce((sum, item) => sum + item.lineTotal, 0) : 0;
-    console.log(`📝 Customer wants to add more items. Current cart total: ₹${currentCartTotal}`);
-    
-    await sock.sendMessage(from, {
-      text: `🔄 *Back to Menu - Add More Items*\n\n${generateMenuMessage()}\n\n📌 Current cart value: ₹${currentCartTotal} (new items will be added to this)`
-    });
-  } else if (response === 'no' || response === 'n') {
-    // Confirm order and save
-    const cart = userCart.get(from);
-    if (!cart) {
-      console.log(`⚠️ No cart found for ${from}`);
-      await sock.sendMessage(from, { text: generateMenuMessage() });
-      userOrderingSession.set(from, { state: 'awaiting_items' });
-      return;
+// Merge cart — combines same itemId entries, sums quantities
+const mergeCartItems = (cartItems) => {
+  const merged = new Map();
+  for (const item of cartItems) {
+    const key = item.id;
+    if (merged.has(key)) {
+      const ex = merged.get(key);
+      ex.quantity  += item.quantity;
+      ex.lineTotal  = ex.price * ex.quantity;
+    } else {
+      merged.set(key, { ...item });
     }
-
-    const totalPrice = cart.reduce((sum, item) => sum + item.lineTotal, 0);
-    const itemsJSON = JSON.stringify(cart);
-    
-    // ✅ USE IST TIMESTAMP INSTEAD OF UTC
-    const timestamp = getISTTimestamp();
-    console.log(`⏰ Timestamp (IST): ${timestamp}`);
-
-    // ✅ Normalize phone number
-    const normalizedPhone = normalizePhone(from);
-    console.log(`📝 Processing order for: ${normalizedPhone}`);
-    console.log(`📦 Items: ${JSON.stringify(cart.map(c => c.name))}`);
-
-    // ✅ Fetch fresh customer data FIRST (before database operations)
-    let customerDetails = await getCustomerDetails(from);
-    console.log(`📦 Customer lookup result: name="${customerDetails.name}", phone="${customerDetails.phone}"`);
-
-    // Save to database
-    try {
-      // Step 1: Insert or update customer (to satisfy foreign key constraint)
-      await pool.query(
-        `INSERT INTO customers (phone, name, created_at, updated_at) 
-         VALUES ($1, $2, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-         ON CONFLICT (phone) DO UPDATE SET name = $2, updated_at = CURRENT_TIMESTAMP`,
-        [customerDetails.phone, customerDetails.name]
-      );
-      console.log(`✅ Customer saved: ${customerDetails.name} (${customerDetails.phone})`);
-
-      // Step 2: Insert order with customer details
-      const result = await pool.query(
-        'INSERT INTO orders (timestamp, name, phone, items, total_price, status) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id',
-        [timestamp, customerDetails.name, customerDetails.phone, itemsJSON, totalPrice, 'pending']
-      );
-      console.log(`✅ Order saved: ID=${result.rows[0].id}, Amount=₹${totalPrice}`);
-    } catch (error) {
-      console.error(`❌ Database error:`, error.message);
-      await sock.sendMessage(from, { text: '❌ Error processing order. Please try again.' });
-      return;
-    }
-
-    // ✅ Save to CSV with customer details
-    const cartSummary = cart.map(item => `${item.name}(${item.quantity})`).join(', ');
-    saveOrderToCSV(timestamp, customerDetails.name, customerDetails.phone, cartSummary, totalPrice);
-    console.log(`✅ CSV saved`);
-
-    // Send order confirmation
-    const cartDetails = cart.map(item => 
-      `${item.name} x${item.quantity} = ₹${item.lineTotal}`
-    ).join('\n');
-
-    const confirmationMessage = `✅ *ORDER CONFIRMED!*\n\n📦 *Items:*\n${cartDetails}\n\n💰 *Total: ₹${totalPrice}*\n\n💳 *Payment Details:*\nPay below UPI Number - *9373332785*\n\nThank you for your order! 🙏`;
-    
-    await sock.sendMessage(from, { text: confirmationMessage });
-    console.log(`📤 Confirmation sent`);
-
-    // ✅ Emit to frontend with correct customer data
-    io.emit('newOrder', {
-      timestamp,
-      name: customerDetails.name,
-      phone: customerDetails.phone,
-      items: cartSummary,
-      total: totalPrice
-    });
-    console.log(`📡 Frontend notified`);
-
-    // Clear session
-    userCart.delete(from);
-    userSelectedItems.delete(from);
-    userOrderingSession.delete(from);
-
-    console.log(`🎉 Complete: ${customerDetails.name} - ${cartSummary} = ₹${totalPrice}`);
-  } else {
-    // Ignore invalid yes/no responses - wait for valid input
-    console.log(`⚠️ Invalid yes/no response from ${from}: "${text}"`);
   }
+  return Array.from(merged.values());
+};
+
+// Build WhatsApp cart display message
+const buildCartMessage = (cart) => {
+  const merged = mergeCartItems(cart);
+  const total  = merged.reduce((sum, i) => sum + i.lineTotal, 0);
+
+  const lines = merged.map(i => {
+    const emoji = i.quantity >= 3 ? '🔥' : i.quantity >= 2 ? '✌️' : '✅';
+    return `${emoji} *${i.name}* × ${i.quantity}  — ₹${i.lineTotal}`;
+  }).join('\n');
+
+  const itemList = merged.map(i => `*${i.id}*=${i.name.split(' ')[0]}`).join(', ');
+
+  return `🛒 *Your Cart*
+━━━━━━━━━━━━━━━━━━━━
+${lines}
+━━━━━━━━━━━━━━━━━━━━
+💰 *Total: ₹${total}*
+
+_To add more, send item number(s)_
+_To remove: *remove ${merged[0].id}*_
+✏️  *DONE* to confirm  ·  *CLEAR* to reset`;
+};
+
+// Handle item selection in 'ordering' state
+const handleItemSelection = async (from, text, customerName) => {
+  const parsed = parseOrderInput(text);
+
+  if (!parsed) {
+    // Unknown input
+    const cart = userCart.get(from);
+    if (cart?.length) {
+      await sendWAMessage(from, {
+        text: `❓ _Not recognised._\n\nSend item number(s), e.g. *3* or *1,5*\nOr *remove 3* to remove from cart\n*DONE* to confirm · *CLEAR* to restart`
+      }, customerName);
+    } else {
+      // No cart yet — re-show menu silently (user probably typed random text)
+      await sendWAMessage(from, { text: generateMenuMessage(null) }, customerName);
+    }
+    return;
+  }
+
+  if (parsed.type === 'remove') {
+    const { itemId } = parsed.items[0];
+    const existingCart = userCart.get(from) || [];
+    const updatedCart = existingCart.filter(i => i.id !== itemId);
+    if (updatedCart.length === existingCart.length) {
+      await sendWAMessage(from, {
+        text: `⚠️ *${COMPLETE_MENU[itemId].name}* is not in your cart.`
+      }, customerName);
+      return;
+    }
+    if (updatedCart.length === 0) {
+      userCart.delete(from);
+      await sendWAMessage(from, { text: `🛒 Cart is empty.\n\n${generateMenuMessage(null)}` }, customerName);
+    } else {
+      userCart.set(from, updatedCart);
+      await sendWAMessage(from, { text: buildCartMessage(updatedCart) }, customerName);
+    }
+    return;
+  }
+
+  // parsed.type === 'select' — store pending items, ask for qtys
+  const session = userOrderingSession.get(from);
+  session.pendingItems = parsed.items;
+  session.state = 'qty_input';
+  userOrderingSession.set(from, session);
+
+  if (parsed.items.length === 1) {
+    // Single item — simple ask
+    const item = COMPLETE_MENU[parsed.items[0].itemId];
+    await sendWAMessage(from, {
+      text: `✅ *${item.name}* — ₹${item.price}\n\nHow many? _(reply with a number, e.g. *2*)_`
+    }, customerName);
+  } else {
+    // Multiple items — show list and ask for all qtys
+    const lines = parsed.items.map((p, i) => {
+      const item = COMPLETE_MENU[p.itemId];
+      return `  ${i + 1}. *${item.name}* — ₹${item.price}`;
+    }).join('\n');
+    const example = parsed.items.map((_, i) => i === 0 ? '2' : '1').join(' ');
+    await sendWAMessage(from, {
+      text: `✅ *${parsed.items.length} items selected:*\n${lines}\n\nHow many of each?\n_Reply with qty for each (space-separated)_\n_e.g. *${example}* = ${parsed.items.map((p, i) => `${COMPLETE_MENU[p.itemId].name.split(' ')[0]}×${i === 0 ? '2' : '1'}`).join(', ')}_\n_Or just *1* for one of each_`
+    }, customerName);
+  }
+};
+
+// Confirm and place order — called when user sends DONE
+const confirmOrder = async (from, customerName) => {
+  const rawCart = userCart.get(from);
+  if (!rawCart || rawCart.length === 0) {
+    await sendWAMessage(from, {
+      text: `🛒 Your cart is empty!\n\n${generateMenuMessage()}`
+    }, customerName);
+    return;
+  }
+
+  // Merge duplicates one final time before saving
+  const cart = mergeCartItems(rawCart);
+  userCart.set(from, cart);
+
+  const totalPrice = cart.reduce((sum, item) => sum + item.lineTotal, 0);
+  const itemsJSON  = JSON.stringify(cart);
+  const timestamp  = getISTTimestamp();
+
+  console.log(`⏰ Timestamp (IST): ${timestamp}`);
+  console.log(`📝 Processing order for: ${normalizePhone(from)}`);
+  console.log(`📦 Items: ${JSON.stringify(cart.map(c => c.name))}`);
+
+  // Fetch customer details (session-cached)
+  let customerDetails = await getCustomerDetails(from);
+  console.log(`📦 Customer: name="${customerDetails.name}", phone="${customerDetails.phone}"`);
+
+  try {
+    // Upsert customer — preserve real phone, bind WhatsApp JID
+    await pool.query(
+      `INSERT INTO customers (phone, name, whatsapp_jid, created_at, updated_at)
+       VALUES ($1, $2, $3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+       ON CONFLICT (phone) DO UPDATE
+         SET name = $2,
+             whatsapp_jid = COALESCE(EXCLUDED.whatsapp_jid, customers.whatsapp_jid),
+             updated_at = CURRENT_TIMESTAMP`,
+      [customerDetails.phone, customerDetails.name, from.includes('@') ? from : null]
+    );
+    console.log(`✅ Customer saved: ${customerDetails.name} (${customerDetails.phone})`);
+
+    // Insert order — uses real phone from customers table
+    const result = await pool.query(
+      'INSERT INTO orders (timestamp, name, phone, items, total_price, status) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id',
+      [timestamp, customerDetails.name, customerDetails.phone, itemsJSON, totalPrice, 'pending']
+    );
+    console.log(`✅ Order saved: ID=${result.rows[0].id}, Amount=₹${totalPrice}`);
+  } catch (error) {
+    console.error(`❌ Database error:`, error.message);
+    await sendWAMessage(from, { text: '❌ Error processing order. Please try again.' }, customerName);
+    return;
+  }
+
+  // Save to CSV
+  const cartSummary = cart.map(item => `${item.name}(×${item.quantity})`).join(', ');
+  saveOrderToCSV(timestamp, customerDetails.name, customerDetails.phone, cartSummary, totalPrice);
+  console.log(`✅ CSV saved`);
+
+  // Send confirmation
+  const cartDetails = cart.map(item =>
+    `  • ${item.name} ×${item.quantity}  —  ₹${item.lineTotal}`
+  ).join('\n');
+
+  const confirmationMessage =
+    `🎉 *Order Confirmed!* ✅\n\n${cartDetails}\n\n💰 *Total: ₹${totalPrice}*\n\n💳 *Pay via UPI:*\n📲 *9373332785*\n\n_Please share screenshot once paid 🙏_\n_Thank you! Stay healthy 🌿_\n_— Swasth Cafe_`;
+
+  await sendWAMessage(from, { text: confirmationMessage }, customerDetails.name);
+  console.log(`📤 Confirmation sent`);
+
+  // Notify frontend
+  io.emit('newOrder', {
+    timestamp,
+    name: customerDetails.name,
+    phone: customerDetails.phone,
+    items: cartSummary,
+    total: totalPrice
+  });
+  console.log(`📡 Frontend notified`);
+
+  // Clear session
+  userCart.delete(from);
+  userSelectedItems.delete(from);
+  userOrderingSession.delete(from);
+
+  console.log(`🎉 Complete: ${customerDetails.name} - ${cartSummary} = ₹${totalPrice}`);
 };
 
 // ========================
 // HELPER FUNCTIONS
 // ========================
 
-const getCustomerName = async (phone) => {
+const getCustomerName = async (phone, pushName = null) => {
+  // Session cache — avoids repeat DB calls during an active ordering session
+  const session = userOrderingSession.get(phone);
+  if (session?.customerName) return session.customerName;
+
   const normalizedPhone = normalizePhone(phone);
+  const rawJid = phone; // keep the original JID (@lid or @s.whatsapp.net) for JID-column lookup
+
   try {
-    const result = await pool.query(
-      'SELECT name FROM customers WHERE phone = $1',
-      [normalizedPhone]
-    );
-    return result.rows.length > 0 ? result.rows[0].name : 'Customer';
+    // ── 1. Look up by whatsapp_jid (handles LID users linked to a real-phone row) ──
+    let row = null;
+    if (rawJid && rawJid.includes('@')) {
+      const jidRes = await pool.query(
+        'SELECT name, phone, address FROM customers WHERE whatsapp_jid = $1',
+        [rawJid]
+      );
+      if (jidRes.rows.length > 0) row = jidRes.rows[0];
+    }
+
+    // ── 2. Fall back to normalized phone lookup ──
+    if (!row && normalizedPhone) {
+      const phoneRes = await pool.query(
+        'SELECT name, phone, address FROM customers WHERE phone = $1',
+        [normalizedPhone]
+      );
+      if (phoneRes.rows.length > 0) {
+        row = phoneRes.rows[0];
+        // Bind this JID to the customer so future messages resolve via JID
+        if (rawJid && rawJid.includes('@')) {
+          await pool.query(
+            'UPDATE customers SET whatsapp_jid = $1 WHERE phone = $2 AND (whatsapp_jid IS NULL OR whatsapp_jid = \'\')',
+            [rawJid, row.phone]
+          );
+        }
+      }
+    }
+
+    if (row) {
+      // Cache full details in session
+      if (session) {
+        session.customerName    = row.name;
+        session.customerPhone   = row.phone;  // ← always the real DB phone
+        session.customerAddress = row.address;
+      }
+      return row.name;
+    }
+
+    // ── 3. New customer — auto-save with WhatsApp display name ──
+    if (pushName && normalizedPhone) {
+      await pool.query(
+        'INSERT INTO customers (phone, name, whatsapp_jid) VALUES ($1, $2, $3) ON CONFLICT (phone) DO NOTHING',
+        [normalizedPhone, pushName, rawJid && rawJid.includes('@') ? rawJid : null]
+      );
+      console.log(`✅ Auto-saved new customer: ${pushName} (${normalizedPhone})`);
+      if (session) {
+        session.customerName  = pushName;
+        session.customerPhone = normalizedPhone;
+      }
+      return pushName;
+    }
+
+    if (session) session.customerName = 'Customer';
+    return 'Customer';
   } catch (error) {
     console.error('❌ Error getting customer name:', error.message);
-    return 'Customer';
+    return pushName || 'Customer';
+  }
+};
+
+// ========================
+// CHAT LOGGING
+// ========================
+const logChatMessage = async (phone, direction, message, customerName = null) => {
+  const normalizedPhone = normalizePhone(phone);
+  if (!normalizedPhone) return;
+
+  let name = customerName;
+  if (!name) {
+    name = await getCustomerName(phone);
+  }
+
+  try {
+    await pool.query(
+      `INSERT INTO chat_logs (phone, customer_name, direction, message)
+       VALUES ($1, $2, $3, $4)`,
+      [normalizedPhone, name || 'Unknown', direction, message]
+    );
+  } catch (error) {
+    console.error('❌ Chat log error:', error.message);
+  }
+};
+
+// ========================
+// SEND WHATSAPP + LOG OUTGOING
+// ========================
+const sendWAMessage = async (to, messageObj, customerName = null) => {
+  if (!sock) {
+    console.error('❌ sendWAMessage: WhatsApp socket not ready');
+    return;
+  }
+  try {
+    await sock.sendMessage(to, messageObj);
+    const text = messageObj.text || '[media/other]';
+    console.log(`📤 Sent to ${to}: "${String(text).substring(0, 60)}"`);
+    await logChatMessage(to, 'outgoing', text, customerName);
+  } catch (err) {
+    console.error(`❌ sendWAMessage failed (to: ${to}):`, err.message);
   }
 };
 
@@ -773,26 +1148,38 @@ const initializeCronJob = () => {
   
   cron.schedule('0 9 * * *', async () => {
     console.log('📢 Broadcasting menu at 9 AM...');
-    
-    const customersPath = path.join(__dirname, 'customers.json');
-    if (!fs.existsSync(customersPath)) {
-      console.log('⚠️ customers.json not found');
-      return;
-    }
 
     try {
-      const customers = JSON.parse(fs.readFileSync(customersPath, 'utf8'));
+      // Use DB whatsapp_contacts view — plain phone digits, real name, no @lid or encoding
+      const result = await pool.query('SELECT name, phone FROM whatsapp_contacts');
+      const customers = result.rows;
+
+      if (customers.length === 0) {
+        console.log('⚠️ No customers in database for broadcast');
+        return;
+      }
+
+      let successCount = 0;
+      let failCount = 0;
 
       for (const customer of customers) {
         try {
-          const jid = customer.phone.includes('@') ? customer.phone : `${customer.phone}@s.whatsapp.net`;
-          await sock.sendMessage(jid, { text: generateMenuMessage() });
+          // Phone stored as plain digits — append @s.whatsapp.net for WhatsApp JID
+          const jid = `${customer.phone}@s.whatsapp.net`;
+          const menuText = generateMenuMessage();
+          await sock.sendMessage(jid, { text: menuText });
+          // Log broadcast as outgoing chat
+          await logChatMessage(customer.phone, 'outgoing', menuText, customer.name);
           console.log(`✅ Menu sent to ${customer.name} (${customer.phone})`);
+          successCount++;
+          // Small delay to avoid WhatsApp rate limiting
+          await new Promise(resolve => setTimeout(resolve, 500));
         } catch (error) {
           console.error(`❌ Failed to send to ${customer.phone}: ${error.message}`);
+          failCount++;
         }
       }
-      console.log('✅ Daily menu broadcast completed!');
+      console.log(`✅ Daily menu broadcast completed! Success: ${successCount}, Failed: ${failCount}`);
     } catch (error) {
       console.error('❌ Broadcast error:', error.message);
     }
@@ -919,29 +1306,248 @@ app.get('/api/orders/export', async (req, res) => {
       'SELECT id, timestamp, name, phone, items, total_price, status FROM orders ORDER BY timestamp DESC'
     );
     const csv = generateCSV(result.rows);
-    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', 'attachment; filename="orders.csv"');
-    res.send(csv);
+    res.send('\uFEFF' + csv); // UTF-8 BOM for Excel — preserves Indian names correctly
   } catch (error) {
     console.error('❌ Error exporting CSV:', error.message);
     res.status(500).json({ error: error.message });
   }
 });
 
+// Helper: parse JSONB items into human-readable string
+const formatItemsReadable = (rawItems) => {
+  try {
+    const arr = typeof rawItems === 'string' ? JSON.parse(rawItems) : rawItems;
+    if (!Array.isArray(arr)) return String(rawItems);
+    // Merge duplicate items before display
+    const map = new Map();
+    for (const i of arr) {
+      const key = i.id != null ? i.id : i.name;
+      if (map.has(key)) {
+        const ex = map.get(key);
+        ex.quantity = (ex.quantity || 1) + (i.quantity || 1);
+      } else {
+        map.set(key, { ...i });
+      }
+    }
+    return Array.from(map.values()).map(i => `${i.name}×${i.quantity}`).join(', ');
+  } catch { return String(rawItems); }
+};
+
 const generateCSV = (orders) => {
-  let csv = 'Timestamp,Name,Phone,Items,Total Price,Status\n';
+  let csv = 'Order ID,Date & Time,Customer Name,Phone,Items,Total Price,Status\n';
   orders.forEach(order => {
-    const items = typeof order.items === 'string' ? order.items : JSON.stringify(order.items);
-    const itemsEscaped = items.replace(/"/g, '""'); // Escape quotes for CSV
-    csv += `"${order.timestamp}","${order.name}","${order.phone}","${itemsEscaped}",${order.total_price},"${order.status}"\n`;
+    const readable = formatItemsReadable(order.items).replace(/"/g, '""');
+    const ts = new Date(order.timestamp).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
+    csv += `${order.id},"${ts}","${order.name}","${order.phone}","${readable}",${order.total_price},"${order.status}"\n`;
   });
   return csv;
 };
 
 // ========================
+// CSV HELPERS — Customers & Chats
+// ========================
+
+const generateCustomersCSV = (customers) => {
+  // Phone stored as plain digits (e.g. 919876543210) — output as-is, no encoding
+  let csv = 'ID,Name,WhatsApp Phone,Address,Created At\n';
+  customers.forEach(c => {
+    const name    = (c.name    || '').replace(/"/g, '""');
+    const address = (c.address || '').replace(/"/g, '""');
+    csv += `${c.id},"${name}","${c.phone}","${address}","${c.created_at}"\n`;
+  });
+  return csv;
+};
+
+const generateChatsCSV = (chats) => {
+  let csv = 'Phone,Customer Name,Direction,Message,Timestamp\n';
+  chats.forEach(chat => {
+    const name    = (chat.customer_name || '').replace(/"/g, '""');
+    const message = (chat.message       || '').replace(/"/g, '""');
+    csv += `"${chat.phone}","${name}","${chat.direction}","${message}","${chat.created_at}"\n`;
+  });
+  return csv;
+};
+
+// ========================
+// CUSTOMERS CSV EXPORT — plain WhatsApp name + number, no encoding
+// ========================
+app.get('/api/customers/export', async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT id, name, phone, address, created_at FROM whatsapp_contacts'
+    );
+    const csv = generateCustomersCSV(result.rows);
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="whatsapp_contacts.csv"');
+    res.send('\uFEFF' + csv); // UTF-8 BOM for Excel
+  } catch (error) {
+    console.error('❌ Error exporting customers CSV:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ========================
+// CHAT LOGS API
+// ========================
+app.get('/api/chats', async (req, res) => {
+  try {
+    const { phone, limit = 200, offset = 0 } = req.query;
+    let query;
+    let params;
+
+    if (phone) {
+      const normalizedPhone = normalizePhone(decodeURIComponent(phone));
+      query  = `SELECT id, phone, customer_name, direction, message, created_at
+                FROM chat_logs WHERE phone = $1
+                ORDER BY created_at DESC LIMIT $2 OFFSET $3`;
+      params = [normalizedPhone, parseInt(limit), parseInt(offset)];
+    } else {
+      query  = `SELECT id, phone, customer_name, direction, message, created_at
+                FROM chat_logs
+                ORDER BY created_at DESC LIMIT $1 OFFSET $2`;
+      params = [parseInt(limit), parseInt(offset)];
+    }
+
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+  } catch (error) {
+    console.error('❌ Error fetching chats:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/chats/export', async (req, res) => {
+  try {
+    const { phone } = req.query;
+    let query;
+    let params = [];
+
+    if (phone) {
+      const normalizedPhone = normalizePhone(decodeURIComponent(phone));
+      query  = `SELECT phone, customer_name, direction, message, created_at
+                FROM chat_logs WHERE phone = $1 ORDER BY created_at ASC`;
+      params = [normalizedPhone];
+    } else {
+      query = `SELECT phone, customer_name, direction, message, created_at
+               FROM chat_logs ORDER BY created_at DESC`;
+    }
+
+    const result = await pool.query(query, params);
+    const csv    = generateChatsCSV(result.rows);
+    const fname  = phone ? `chat_${normalizePhone(phone)}.csv` : 'chat_logs.csv';
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${fname}"`);
+    res.send('\uFEFF' + csv);
+  } catch (error) {
+    console.error('❌ Error exporting chats CSV:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ========================
+// COMBINED CONTACTS + CHAT ACTIVITY EXPORT
+// ========================
+// Helper: merge duplicate items in a JSONB array and return readable string
+const mergeAndFormatItems = (rawItems) => {
+  try {
+    const arr = typeof rawItems === 'string' ? JSON.parse(rawItems) : (rawItems || []);
+    if (!Array.isArray(arr) || arr.length === 0) return '';
+    // Merge duplicates
+    const map = new Map();
+    for (const item of arr) {
+      const key = item.id || item.name;
+      if (map.has(key)) {
+        const ex = map.get(key);
+        ex.quantity = (ex.quantity || 1) + (item.quantity || 1);
+        ex.lineTotal = (ex.price || 0) * ex.quantity;
+      } else {
+        map.set(key, { ...item });
+      }
+    }
+    return Array.from(map.values()).map(i => `${i.name} ×${i.quantity}`).join(', ');
+  } catch { return String(rawItems || ''); }
+};
+
+app.get('/api/combined/export', async (req, res) => {
+  try {
+    // Combined query: contacts + chat stats + order stats
+    const result = await pool.query(`
+      SELECT
+        c.id,
+        c.name,
+        c.phone,
+        c.address,
+        c.created_at                                               AS joined,
+        COUNT(DISTINCT cl.id)                                      AS total_chats,
+        SUM(CASE WHEN cl.direction = 'incoming' THEN 1 ELSE 0 END) AS msgs_received,
+        SUM(CASE WHEN cl.direction = 'outgoing' THEN 1 ELSE 0 END) AS msgs_sent,
+        MAX(cl.created_at)                                         AS last_chat,
+        COUNT(DISTINCT o.id)                                       AS total_orders,
+        COALESCE(SUM(o.total_price), 0)                            AS total_spent,
+        MAX(o.timestamp)                                           AS last_order
+      FROM whatsapp_contacts c
+      LEFT JOIN chat_logs cl ON cl.phone = c.phone
+      LEFT JOIN orders     o  ON o.phone  = c.phone
+      GROUP BY c.id, c.name, c.phone, c.address, c.created_at
+      ORDER BY c.name ASC
+    `);
+
+    let csv = 'Customer Name,WhatsApp Phone,Address,Added On,Total Chats,Msgs Received,Msgs Sent,Last Chat,Total Orders,Total Spent (₹),Last Order\n';
+    result.rows.forEach(r => {
+      const name     = (r.name    || '').replace(/"/g, '""');
+      const address  = (r.address || '').replace(/"/g, '""');
+      const joined   = r.joined     ? new Date(r.joined).toLocaleString('en-IN',     { timeZone: 'Asia/Kolkata' }) : '';
+      const lastChat = r.last_chat  ? new Date(r.last_chat).toLocaleString('en-IN',  { timeZone: 'Asia/Kolkata' }) : 'No chats';
+      const lastOrd  = r.last_order ? new Date(r.last_order).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }) : 'No orders';
+      csv += `"${name}","${r.phone}","${address}","${joined}",${r.total_chats || 0},${r.msgs_received || 0},${r.msgs_sent || 0},"${lastChat}",${r.total_orders || 0},${parseFloat(r.total_spent || 0).toFixed(2)},"${lastOrd}"\n`;
+    });
+
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="swasth_contacts_orders_activity.csv"');
+    res.send('\uFEFF' + csv);
+  } catch (error) {
+    console.error('❌ Error exporting combined CSV:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ========================
+// ORDERS WITH CUSTOMER DETAILS EXPORT (merged items, correct phone)
+// ========================
+app.get('/api/orders/full-export', async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT id, timestamp, name, phone, items, total_price, status FROM orders ORDER BY timestamp DESC'
+    );
+    let csv = 'Order ID,Date & Time (IST),Customer Name,WhatsApp Phone,Items,Total (₹),Status\n';
+    result.rows.forEach(order => {
+      const readable = mergeAndFormatItems(order.items).replace(/"/g, '""');
+      const ts       = new Date(order.timestamp).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
+      const name     = (order.name || '').replace(/"/g, '""');
+      csv += `${order.id},"${ts}","${name}","${order.phone}","${readable}",${parseFloat(order.total_price || 0).toFixed(2)},"${order.status || 'pending'}"\n`;
+    });
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="orders_full.csv"');
+    res.send('\uFEFF' + csv);
+  } catch (error) {
+    console.error('❌ Error exporting full orders CSV:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ========================
 // START SERVER
 // ========================
 const PORT = process.env.PORT || 3001;
+
+// Prevent Node.js from exiting when WhatsApp disconnects.
+// The HTTP server keeps the event loop alive, but an explicit interval
+// guarantees it even during a reconnect gap.
+const _keepAlive = setInterval(() => {}, 60_000);
+_keepAlive.unref(); // Don't block intentional shutdown
+
 server.listen(PORT, async () => {
   console.log('\n═══════════════════════════════════════════════');
   console.log('🍽️  SWASTH ORDER AGENT - Server Started');
@@ -956,6 +1562,7 @@ server.listen(PORT, async () => {
 
 process.on('SIGINT', () => {
   console.log('\n⏹️ Shutting down gracefully...');
+  clearInterval(_keepAlive);
   pool.end(() => {
     console.log('✅ PostgreSQL connection pool closed');
     server.close(() => {

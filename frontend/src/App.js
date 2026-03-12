@@ -136,6 +136,24 @@ function App() {
     }
   };
 
+  // Combined export: contacts + chat activity + order stats in one CSV
+  const handleExportCombinedCSV = async () => {
+    try {
+      window.location.href = `${API_URL}/api/combined/export`;
+    } catch (error) {
+      console.error('Error exporting combined CSV:', error);
+    }
+  };
+
+  // Full orders export: all orders with correct customer name + merged items
+  const handleExportFullOrders = async () => {
+    try {
+      window.location.href = `${API_URL}/api/orders/full-export`;
+    } catch (error) {
+      console.error('Error exporting full orders CSV:', error);
+    }
+  };
+
   return (
     <div className="app-container">
       {/* Header */}
@@ -224,6 +242,8 @@ function App() {
                   ordersCount={orders.length} 
                   customersCount={customers.length}
                   onExportCSV={handleExportCSV}
+                  onExportCombinedCSV={handleExportCombinedCSV}
+                  onExportFullOrders={handleExportFullOrders}
                 />
               )}
 
