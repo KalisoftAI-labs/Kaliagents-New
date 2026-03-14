@@ -1,5 +1,27 @@
 import React from 'react';
 
+// Parse JSONB items, merge duplicates, return readable string: "Amla juice ×2, Carrot juice ×1"
+const formatItems = (items) => {
+  try {
+    const arr = typeof items === 'string' ? JSON.parse(items) : items;
+    if (!Array.isArray(arr)) return items || 'N/A';
+    // Merge duplicate items (same id or name) by summing quantities
+    const merged = new Map();
+    for (const i of arr) {
+      const key = i.id != null ? i.id : i.name;
+      if (merged.has(key)) {
+        const ex = merged.get(key);
+        ex.quantity = (ex.quantity || 1) + (i.quantity || 1);
+      } else {
+        merged.set(key, { ...i });
+      }
+    }
+    return Array.from(merged.values()).map(i => `${i.name} ×${i.quantity}`).join(', ');
+  } catch {
+    return items || 'N/A';
+  }
+};
+
 const OrdersList = ({ orders, onExportCSV }) => {
   return (
     <div className="card-modern">
@@ -52,7 +74,7 @@ const OrdersList = ({ orders, onExportCSV }) => {
                   </td>
                   <td className="text-small">
                     <span style={{ fontWeight: 500, color: 'var(--primary)' }}>
-                      {order.items || 'N/A'}
+                      {formatItems(order.items)}
                     </span>
                   </td>
                   <td className="text-bold">

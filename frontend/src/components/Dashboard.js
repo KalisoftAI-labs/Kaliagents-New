@@ -1,6 +1,6 @@
 import React from 'react';
 
-const Dashboard = ({ ordersCount, customersCount, onExportCSV }) => {
+const Dashboard = ({ ordersCount, customersCount, onExportCSV, onExportCombinedCSV, onExportFullOrders }) => {
   return (
     <div>
       {/* Stats Cards */}
@@ -51,10 +51,19 @@ const Dashboard = ({ ordersCount, customersCount, onExportCSV }) => {
             onClick={onExportCSV}
             className="btn-modern btn-primary"
           >
-            📥 Export Orders to CSV
+            📥 Export Orders CSV
           </button>
-          <button className="btn-modern btn-secondary">
-            🔄 Refresh Data
+          <button 
+            onClick={onExportFullOrders}
+            className="btn-modern btn-primary"
+          >
+            📋 Full Orders + Contact CSV
+          </button>
+          <button 
+            onClick={onExportCombinedCSV}
+            className="btn-modern btn-secondary"
+          >
+            📊 Contacts + Orders Activity CSV
           </button>
         </div>
       </div>
