@@ -15,6 +15,8 @@ const socket = io(API_URL, {
   reconnectionAttempts: 10
 });
 
+
+
 function App() {
   const [connectionStatus, setConnectionStatus] = useState('disconnected');
   const [orders, setOrders] = useState([]);
