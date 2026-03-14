@@ -1,10 +1,11 @@
 import React, { useState } from 'react';
+import axios from 'axios';
 import './CustomerRegistration.css';
 
-const CustomerRegistration = ({ onComplete }) => {
+const CustomerRegistration = ({ onComplete, initialPhone }) => {
   const [formData, setFormData] = useState({
     fullName: '',
-    phoneNumber: '',
+    phoneNumber: initialPhone || '',
     societyName: '',
     flatNumber: '',
     age: ''
@@ -17,9 +18,24 @@ const CustomerRegistration = ({ onComplete }) => {
     });
   };
 
-  const handleSubmit = (e) => {
+  const handleSubmit = async (e) => {
     e.preventDefault();
     console.log('Form submitted:', formData);
+    
+    // Save to the backend
+    try {
+      const API_URL = process.env.REACT_APP_API_URL || 'http://localhost:3001';
+      await axios.post(`${API_URL}/api/customers`, { 
+        name: formData.fullName,
+        phone: formData.phoneNumber,
+        societyName: formData.societyName,
+        flatNumber: formData.flatNumber,
+        age: formData.age
+      });
+    } catch (error) {
+      console.error('Error saving customer:', error);
+    }
+
     if (onComplete) {
       onComplete(formData);
     }

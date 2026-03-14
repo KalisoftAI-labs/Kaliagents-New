@@ -102,6 +102,7 @@ const generateMenuMessage = (cart = null) => {
 // ========================
 // DATABASE SETUP (PostgreSQL)
 // ========================
+
 const pool = new Pool({
   host: process.env.DB_HOST || 'localhost',
   port: process.env.DB_PORT || 5432,
@@ -135,8 +136,11 @@ const initializeDatabase = async () => {
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
-    // Add whatsapp_jid column to existing tables that predate this migration
+    // Add new columns to existing tables
     await pool.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS whatsapp_jid VARCHAR(60)`);
+    await pool.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS society_name VARCHAR(255)`);
+    await pool.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS flat_number VARCHAR(100)`);
+    await pool.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS age INTEGER`);
     console.log('✅ Customers table ready');
 
     // Create orders table
@@ -504,7 +508,26 @@ const connectWhatsApp = async () => {
         console.log('\n✅ ✅ ✅ WhatsApp Connected Successfully! ✅ ✅ ✅\n');
         connectionStatus = 'connected';
         qrCodeUrl = null;
-        io.emit('connectionStatus', { status: 'connected' });
+        
+        let isRegistered = false;
+        let activePhone = null;
+
+        if (sock?.user?.id) {
+          activePhone = normalizePhone(sock.user.id);
+          if (activePhone) {
+            pool.query('SELECT 1 FROM customers WHERE phone = $1', [activePhone]).then(res => {
+              isRegistered = res.rowCount > 0;
+              io.emit('connectionStatus', { status: 'connected', phone: activePhone, isRegistered });
+            }).catch(err => {
+              console.error('Error checking registration status:', err);
+              io.emit('connectionStatus', { status: 'connected', phone: activePhone, isRegistered: false });
+            });
+          } else {
+            io.emit('connectionStatus', { status: 'connected' });
+          }
+        } else {
+          io.emit('connectionStatus', { status: 'connected' });
+        }
         console.log('📊 Dashboard is now fully functional');
         console.log('⏰ Menu will broadcast at 9 AM daily\n');
         // Initialize cron job only once
@@ -1210,10 +1233,27 @@ io.on('connection', (socket) => {
 // API ROUTES
 // ========================
 
-app.get('/api/status', (req, res) => {
+app.get('/api/status', async (req, res) => {
+  let isRegistered = false;
+  let activePhone = null;
+
+  if (connectionStatus === 'connected' && sock?.user?.id) {
+    activePhone = normalizePhone(sock.user.id);
+    if (activePhone) {
+      try {
+        const result = await pool.query('SELECT 1 FROM customers WHERE phone = $1', [activePhone]);
+        if (result.rowCount > 0) isRegistered = true;
+      } catch (err) {
+        console.error('Error checking registration status /api/status:', err);
+      }
+    }
+  }
+
   res.json({
     status: connectionStatus,
-    qrCode: qrCodeUrl
+    qrCode: qrCodeUrl,
+    phone: activePhone,
+    isRegistered
   });
 });
 
@@ -1238,7 +1278,7 @@ app.get('/api/menu', (req, res) => {
 });
 
 app.post('/api/customers', async (req, res) => {
-  let { phone, name, address } = req.body;
+  let { phone, name, societyName, flatNumber, age, address } = req.body;
   
   if (!phone || !name) {
     return res.status(400).json({ error: 'Phone and name are required' });
@@ -1246,15 +1286,22 @@ app.post('/api/customers', async (req, res) => {
 
   // ✅ NEW: Normalize phone number
   const normalizedPhone = normalizePhone(phone);
+  
+  // Create a combined address for legacy code/dashboard display if individual fields are provided
+  let combinedAddress = address;
+  if (!combinedAddress && societyName) {
+    combinedAddress = `${societyName}, Flat ${flatNumber}, Age: ${age}`;
+  }
 
   try {
+    // Save to PostgreSQL
     await pool.query(
-      'INSERT INTO customers (phone, name, address) VALUES ($1, $2, $3) ON CONFLICT (phone) DO UPDATE SET name = $2, address = $3',
-      [normalizedPhone, name, address || null]
+      'INSERT INTO customers (phone, name, society_name, flat_number, age, address) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (phone) DO UPDATE SET name = $2, society_name = $3, flat_number = $4, age = $5, address = $6',
+      [normalizedPhone, name, societyName || null, flatNumber || null, age ? parseInt(age) : null, combinedAddress || null]
     );
-    res.json({ success: true, message: 'Customer added', phone: normalizedPhone });
+    res.json({ success: true, message: 'Customer added to Postgres', phone: normalizedPhone });
   } catch (error) {
-    console.error('❌ Error adding customer:', error.message);
+    console.error('❌ Error adding customer to Postgres:', error.message);
     res.status(500).json({ error: error.message });
   }
 });
@@ -1262,11 +1309,11 @@ app.post('/api/customers', async (req, res) => {
 app.get('/api/customers', async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT id, phone, name, address, created_at FROM customers ORDER BY created_at DESC'
+      'SELECT id, phone, name, society_name as "societyName", flat_number as "flatNumber", age, address, created_at FROM customers ORDER BY created_at DESC'
     );
     res.json(result.rows);
   } catch (error) {
-    console.error('❌ Error fetching customers:', error.message);
+    console.error('❌ Error fetching customers from Postgres:', error.message);
     res.status(500).json({ error: error.message });
   }
 });
@@ -1292,7 +1339,7 @@ app.delete('/api/customers/:phone', async (req, res) => {
       return res.status(404).json({ error: 'Customer not found' });
     }
     
-    console.log(`✅ Customer deleted: ${normalizedPhone}`);
+    console.log(`✅ Customer deleted from Postgres: ${normalizedPhone}`);
     res.json({ success: true, message: 'Customer deleted', changes: result.rowCount });
   } catch (error) {
     console.error('❌ Delete error:', error.message);

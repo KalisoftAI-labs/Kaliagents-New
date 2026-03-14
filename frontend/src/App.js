@@ -25,6 +25,7 @@ function App() {
   const [qrCode, setQrCode] = useState(null);
   const [activeTab, setActiveTab] = useState('dashboard');
   const [isRegistered, setIsRegistered] = useState(false);
+  const [activePhone, setActivePhone] = useState(null);
   const [error, setError] = useState(null);
 
   useEffect(() => {
@@ -37,6 +38,12 @@ function App() {
     const handleConnectionStatus = (data) => {
       console.log('🔄 Connection status update:', data.status);
       setConnectionStatus(data.status);
+      if (data.isRegistered !== undefined) {
+        setIsRegistered(data.isRegistered);
+      }
+      if (data.phone) {
+        setActivePhone(data.phone);
+      }
     };
 
     const handleQrCode = (qr) => {
@@ -88,6 +95,12 @@ function App() {
       const res = await axios.get(`${API_URL}/api/status`, { timeout: 5000 });
       console.log('✅ Backend response:', res.data);
       setConnectionStatus(res.data.status);
+      if (res.data.isRegistered !== undefined) {
+        setIsRegistered(res.data.isRegistered);
+      }
+      if (res.data.phone) {
+        setActivePhone(res.data.phone);
+      }
       if (res.data.qrCode) setQrCode(res.data.qrCode);
       setError(null);
     } catch (error) {
@@ -158,27 +171,25 @@ function App() {
     }
   };
 
-  if (connectionStatus === 'connected' && !isRegistered) {
-    return <CustomerRegistration onComplete={() => setIsRegistered(true)} />;
-  }
-
   return (
     <div className="app-container">
-      {/* Header */}
-      <div className="app-header">
-        <div className="app-wrapper">
-          <div className="flex-between">
-            <div>
-              <h1>🏥 Swasth Order Agent</h1>
-              <p>Real-time WhatsApp Order Management System</p>
-            </div>
-            <div className="app-header-status">
-              <span className={`status-indicator ${connectionStatus === 'connected' ? 'connected' : 'disconnected'}`}></span>
-              {connectionStatus === 'connected' ? '✅ Connected' : '❌ Disconnected'}
+      {/* Header - Only hide when on registration screen */}
+      {!(connectionStatus === 'connected' && !isRegistered) && (
+        <div className="app-header">
+          <div className="app-wrapper">
+            <div className="flex-between">
+              <div>
+                <h1>🏥 Swasth Order Agent</h1>
+                <p>Real-time WhatsApp Order Management System</p>
+              </div>
+              <div className="app-header-status">
+                <span className={`status-indicator ${connectionStatus === 'connected' ? 'connected' : 'disconnected'}`}></span>
+                {connectionStatus === 'connected' ? '✅ Connected' : '❌ Disconnected'}
+              </div>
             </div>
           </div>
         </div>
-      </div>
+      )}
 
       {/* Error Alert */}
       {error && (
@@ -198,9 +209,20 @@ function App() {
       )}
 
       {/* Main Content */}
-      <div className="app-wrapper">
+      <div className={!(connectionStatus === 'connected' && !isRegistered) ? "app-wrapper" : ""}>
         {connectionStatus !== 'connected' && (
           <QRScanner qrCode={qrCode} connectionStatus={connectionStatus} />
+        )}
+
+        {connectionStatus === 'connected' && !isRegistered && (
+          <div className="animate-fade-in">
+            <CustomerRegistration 
+              initialPhone={activePhone}
+              onComplete={(data) => {
+                setIsRegistered(true);
+              }} 
+            />
+          </div>
         )}
 
         {connectionStatus === 'connected' && isRegistered && (
