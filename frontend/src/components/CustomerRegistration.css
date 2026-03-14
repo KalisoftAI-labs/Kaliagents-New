@@ -1,0 +1,143 @@
+/* CustomerRegistration.css */
+
+.registration-container {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  min-height: 100vh;
+  background-color: #f2f7f7; /* Light grayish-teal background to match the image */
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  padding: 20px;
+}
+
+.registration-card {
+  position: relative;
+  background-color: #ffffff;
+  width: 100%;
+  max-width: 400px;
+  border-radius: 32px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.05);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  overflow: hidden;
+  padding-bottom: 40px;
+}
+
+/* The half pill design at the top of the card */
+.card-top-decoration {
+  width: 120px;
+  height: 40px;
+  background-color: transparent;
+  border: 2px solid #54a1a3;
+  border-top: none;
+  border-bottom-left-radius: 60px;
+  border-bottom-right-radius: 60px;
+  position: absolute;
+  top: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  opacity: 0.8;
+  z-index: 1;
+}
+
+/* Alternatively, it looks like a solid or bordered shape cutting in. 
+   In the image it is a white shape with a thin border. 
+   The above CSS mimics the U-shape curve at the top. */
+
+.registration-header {
+  text-align: center;
+  margin-top: 70px; /* Space for the top decoration */
+  margin-bottom: 30px;
+  padding: 0 20px;
+}
+
+.brand-title {
+  color: #1f485b; /* Dark teal */
+  font-size: 26px;
+  font-weight: 700;
+  margin: 0 0 10px 0;
+  letter-spacing: -0.5px;
+}
+
+.success-message {
+  color: #5d818e; /* Medium muted teal */
+  font-size: 14px;
+  line-height: 1.5;
+  margin: 0;
+  font-weight: 500;
+}
+
+.registration-form {
+  width: 100%;
+  padding: 0 30px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.input-group {
+  width: 100%;
+}
+
+.registration-input {
+  width: 100%;
+  padding: 16px 20px;
+  font-size: 15px;
+  color: #333333;
+  background-color: #fafdfd;
+  border: 1px solid #dce8e8;
+  border-radius: 16px;
+  outline: none;
+  transition: all 0.3s ease;
+  box-sizing: border-box;
+}
+
+.registration-input::placeholder {
+  color: #a3bcbc;
+  font-weight: 500;
+}
+
+.registration-input:focus {
+  border-color: #54a1a3; /* Highlight color from image */
+  background-color: #ffffff;
+  box-shadow: 0 0 0 4px rgba(84, 161, 163, 0.1);
+}
+
+.address-input {
+  resize: vertical;
+  min-height: 80px;
+}
+
+.btn-get-started {
+  margin-top: 10px;
+  background-color: #54a1a3; /* Teal button */
+  color: #ffffff;
+  border: none;
+  border-radius: 9999px; /* Pill shape */
+  padding: 16px 20px;
+  font-size: 16px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background-color 0.3s, transform 0.1s;
+  width: 100%;
+  box-shadow: 0 4px 12px rgba(84, 161, 163, 0.3);
+}
+
+.btn-get-started:hover {
+  background-color: #438f91;
+}
+
+.btn-get-started:active {
+  transform: scale(0.98);
+}
+
+.registration-footer {
+  margin-top: 30px;
+  font-size: 11px;
+  color: #54a1a3;
+  font-weight: 600;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  text-align: center;
+}
