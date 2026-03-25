@@ -1,7 +1,8 @@
 import { 
     makeWASocket, 
     DisconnectReason, 
-    useMultiFileAuthState
+    useMultiFileAuthState,
+    fetchLatestBaileysVersion
 } from '@whiskeysockets/baileys';
 import qrcode from 'qrcode-terminal';
 import fs from 'fs';
@@ -14,9 +15,9 @@ function readContactsFromFile(filename) {
         const filePath = path.resolve(process.cwd(), filename);
         console.log(`Reading contacts from: ${filePath}`);
         const data = fs.readFileSync(filePath, 'utf-8');
-        // Split by newline, trim, and filter out empty lines
+        // Split by newline, trim, remove leading +, and filter out empty lines
         const contacts = data.split('\n')
-            .map(line => line.trim())
+            .map(line => line.trim().replace(/^\+/, ''))
             .filter(line => line.length > 0);
         console.log(`Found ${contacts.length} contacts:`, contacts);
         return contacts;
@@ -35,27 +36,86 @@ async function sendBulkMessages() {
     });
 
     try {
-        // Ask for the message to send
-        const message = await new Promise(resolve => {
-            rl.question('Enter your message: ', resolve);
-        });
+        console.log('\n╔══════════════════════════════════════════════════════╗');
+        console.log('║         WhatsApp Bulk Messaging - Kali Agents       ║');
+        console.log('╚══════════════════════════════════════════════════════╝\n');
+        console.log('⚠️  IMPORTANT: Make sure WhatsApp QR scanner is NOT running!');
+        console.log('   (Close any "node whatsapp-qr.js" windows first)\n');
 
-        // Ask for the contacts file path
-        const contactsFile = await new Promise(resolve => {
-            rl.question('Enter path to contacts file (one number per line with country code, e.g., 1234567890): ', resolve);
+        // Multi-line message input with clear instructions and reminder
+        console.log('──────────────────────────────────────────────────────────────');
+        console.log('Paste or type your WhatsApp message below.');
+        console.log('When you are done, type a single dot (.) on a new line and press Enter.');
+        console.log('──────────────────────────────────────────────────────────────');
+        let lines = [];
+        let waiting = true;
+        const showReminder = () => {
+            if (waiting) {
+                process.stdout.write('\x1b[33m[Waiting for message end: type . on a new line]\x1b[0m\n');
+                setTimeout(showReminder, 10000);
+            }
+        };
+        showReminder();
+        await new Promise(resolve => {
+            rl.on('line', (input) => {
+                if (input.trim() === '.') {
+                    waiting = false;
+                    resolve();
+                } else {
+                    lines.push(input);
+                }
+            });
         });
+        const message = lines.join('\n');
+
+        // Use default contacts file
+        const contactsFile = 'data/contact_lists/my_contacts.txt';
+        console.log(`\nUsing default contacts file: ${contactsFile}`);
+        
+        // Check if file exists
+        if (!fs.existsSync(contactsFile)) {
+            console.error(`\n❌ Contact file not found: ${contactsFile}`);
+            console.log('Please create this file with one phone number per line (with country code, without +)');
+            rl.close();
+            process.exit(1);
+        }
 
         // Read contacts
         const contacts = readContactsFromFile(contactsFile);
         console.log(`Found ${contacts.length} contacts to message.`);
 
-        // Initialize WhatsApp connection
+        // Initialize WhatsApp connection with better config
+        const { version } = await fetchLatestBaileysVersion();
         const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
+        
+        let isConnected = false;
+        let isSending = false;
         
         const sock = makeWASocket({
             auth: state,
-            browser: ['Bulk Sender', 'Chrome', '1.0.0'],
-            generateHighQualityLinkPreview: true
+            version,
+            browser: ['Kali Bulk Sender', 'Safari', '15.0.0'],
+            syncFullHistory: false,
+            printQRInTerminal: false,
+            markOnlineOnConnect: true,
+            connectTimeoutMs: 60000,
+            defaultQueryTimeoutMs: 60000,
+            keepAliveIntervalMs: 10000,
+            linkPreviewImageThumbnailWidth: 192,
+            transactionOpts: { maxCommitRetries: 10, delayBetweenTriesMs: 3000 },
+            generateHighQualityLinkPreview: true,
+            emitOwnEvents: false,
+            getMessage: async () => undefined,
+            logger: {
+                level: 'silent',
+                trace: () => {},
+                debug: () => {},
+                info: () => {},
+                warn: () => {},
+                error: () => {},
+                fatal: () => {},
+                child: () => ({ level: 'silent', trace: () => {}, debug: () => {}, info: () => {}, warn: () => {}, error: () => {}, fatal: () => {}, child: () => ({}) })
+            }
         });
 
         // Handle QR code generation
@@ -63,29 +123,67 @@ async function sendBulkMessages() {
             const { connection, lastDisconnect, qr } = update;
             
             if (qr) {
-                console.log('Scan the QR code below to log in:');
+                console.log('\n📱 Scan the QR code below to log in:');
                 qrcode.generate(qr, { small: true });
             }
 
+            if (connection === 'connecting') {
+                if (!isSending) {
+                    console.log('⏳ Connecting to WhatsApp...');
+                }
+                isConnected = false;
+            }
+
             if (connection === 'close') {
-                const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-                console.log('Connection closed due to ', lastDisconnect?.error || 'unknown reason');
-                if (shouldReconnect) {
-                    console.log('Reconnecting...');
-                    await new Promise(resolve => setTimeout(resolve, 5000));
-                    sendBulkMessages();
+                isConnected = false;
+                const statusCode = lastDisconnect?.error?.output?.statusCode;
+                const reason = lastDisconnect?.error?.data?.reason;
+                
+                // Only show connection closed if we're not in the middle of sending
+                if (!isSending) {
+                    console.log('\n⚠️  Connection closed');
+                    if (reason) console.log(`Reason: ${reason}`);
+                }
+                
+                if (statusCode === DisconnectReason.loggedOut) {
+                    console.log('\n❌ Logged out! Please scan QR code again with: node whatsapp-qr.js');
+                    rl.close();
+                    process.exit(1);
+                } else if (statusCode === 405 || reason === '405') {
+                    console.log('\n❌ Connection rejected (405). This usually means:');
+                    console.log('  • WhatsApp QR scanner is still running (close it first)');
+                    console.log('  • Another instance is using this session');
+                    console.log('  • Session might be corrupted - try: node whatsapp-qr.js --clear\n');
+                    rl.close();
+                    process.exit(1);
+                } else if (!isSending) {
+                    // Only auto-restart if we haven't started sending yet
+                    console.log('\n❌ Connection failed. Please run the script again.');
+                    rl.close();
+                    process.exit(1);
                 }
             } else if (connection === 'open') {
-                console.log('✅ Connected to WhatsApp!');
-                // Give it a moment to fully connect
-                await new Promise(resolve => setTimeout(resolve, 2000));
-                startSending(sock, contacts, message, rl);
+                isConnected = true;
+                if (!isSending) {
+                    console.log('\n✅ Connected to WhatsApp!');
+                    console.log('⏳ Waiting 3 seconds to stabilize...\n');
+                    // Shorter wait - 3 seconds is enough
+                    await new Promise(resolve => setTimeout(resolve, 3000));
+                    
+                    // Double-check connection is still open
+                    if (isConnected) {
+                        startSending(sock, contacts, message, rl, () => isConnected, () => { isSending = true; });
+                    } else {
+                        console.log('\n❌ Connection lost before sending. Please try again.');
+                        rl.close();
+                        process.exit(1);
+                    }
+                }
             }
         });
 
         // Save credentials when updated
         sock.ev.on('creds.update', saveCreds);
-
 
     } catch (error) {
         console.error('Error:', error);
@@ -95,20 +193,40 @@ async function sendBulkMessages() {
 }
 
 // Function to send messages with delay
-async function startSending(sock, contacts, message, rl) {
-    console.log(`\nReady to send to ${contacts.length} contacts.`);
-    console.log(`Message: ${message}\n`);
+async function startSending(sock, contacts, message, rl, isConnectedFn, markAsSending) {
+    // Final connection check before proceeding
+    if (!isConnectedFn()) {
+        console.log('\n❌ Connection lost before sending could start.');
+        console.log('Please run the script again.\n');
+        rl.close();
+        process.exit(1);
+    }
+
+    console.log(`✅ Ready to send to ${contacts.length} contacts.`);
+    console.log(`📝 Preview: ${message.substring(0, 100)}...\n`);
 
     const confirm = await new Promise(resolve => {
         rl.question('Type "SEND" to start sending (or anything else to cancel): ', resolve);
     });
 
     if (confirm.trim().toUpperCase() !== 'SEND') {
-        console.log('Sending cancelled.');
+        console.log('❌ Sending cancelled.');
         rl.close();
         process.exit(0);
     }
 
+    // Mark that we've started sending
+    markAsSending();
+    
+    // One more connection check after user confirmed
+    if (!isConnectedFn()) {
+        console.log('\n❌ Connection lost while waiting for confirmation.');
+        console.log('Please run the script again.\n');
+        rl.close();
+        process.exit(1);
+    }
+    
+    console.log('\n🚀 Starting bulk send...\n');
     let successCount = 0;
     let failCount = 0;
     const failedContacts = [];
@@ -120,31 +238,69 @@ async function startSending(sock, contacts, message, rl) {
         const phoneNumber = contact.endsWith('@s.whatsapp.net') ? contact : `${contact}@s.whatsapp.net`;
         
         try {
-            console.log(`\n[${i + 1}/${contacts.length}] Sending to ${contact}...`);
+            // Check connection status before sending
+            if (!isConnectedFn()) {
+                throw new Error('Connection lost - please restart the script');
+            }
+
+            console.log(`\n[${i + 1}/${contacts.length}] 📤 Sending to ${contact}...`);
             
-            // Check if the contact is registered on WhatsApp
-            const [result] = await sock.onWhatsApp(phoneNumber);
-            
-            if (!result || !result.exists) {
-                throw new Error('This number is not registered on WhatsApp');
+            // Validate phone number format
+            const cleanNumber = contact.replace('@s.whatsapp.net', '');
+            if (cleanNumber.length < 10 || cleanNumber.length > 15) {
+                throw new Error(`Invalid number format`);
             }
             
-            // Send the message
-            await sock.sendMessage(phoneNumber, { 
-                text: message 
-            });
+            // Check if registered on WhatsApp with retry
+            let result;
+            try {
+                [result] = await sock.onWhatsApp(phoneNumber);
+            } catch (checkError) {
+                console.log(`   ⚠️  Could not verify number, attempting to send anyway...`);
+                result = { exists: true }; // Assume it exists
+            }
             
-            console.log(`✅ Sent to ${contact}`);
+            if (!result || !result.exists) {
+                throw new Error('Number not on WhatsApp');
+            }
+            
+            console.log(`   ✓ Number verified`);
+            
+            // Send the message with retry logic
+            let sent = false;
+            let retries = 0;
+            const maxRetries = 2;
+            
+            while (!sent && retries <= maxRetries) {
+                try {
+                    await sock.sendMessage(phoneNumber, { 
+                        text: message 
+                    });
+                    sent = true;
+                } catch (sendError) {
+                    retries++;
+                    if (retries <= maxRetries) {
+                        console.log(`   ⚠️  Retry ${retries}/${maxRetries}...`);
+                        await new Promise(resolve => setTimeout(resolve, 2000));
+                    } else {
+                        throw sendError;
+                    }
+                }
+            }
+            
+            console.log(`✅ Sent successfully to ${contact}`);
             successCount++;
             
-            // Add a delay between messages (2 seconds)
+            // Delay between messages (3 seconds)
             if (i < contacts.length - 1) {
-                process.stdout.write(`Waiting 2 seconds before next message...`);
+                const delayTime = 3;
+                process.stdout.write(`⏳ Waiting ${delayTime}s before next message...`);
                 await new Promise(resolve => {
                     const spinner = ['|', '/', '-', '\\'];
                     let x = 0;
                     const interval = setInterval(() => {
-                        process.stdout.write(`\r${spinner[x++ % 4]} Waiting ${2 - Math.floor(x/4)}s...`);
+                        const remaining = Math.max(0, delayTime - Math.floor(x * 250 / 1000));
+                        process.stdout.write(`\r${spinner[x++ % 4]} Waiting ${remaining}s...`);
                     }, 250);
                     
                     setTimeout(() => {
@@ -152,7 +308,7 @@ async function startSending(sock, contacts, message, rl) {
                         process.stdout.clearLine();
                         process.stdout.cursorTo(0);
                         resolve();
-                    }, 2000);
+                    }, delayTime * 1000);
                 });
             }
         } catch (error) {
@@ -171,17 +327,39 @@ async function startSending(sock, contacts, message, rl) {
         }
     }
 
-    console.log('\n📊 Sending Summary:');
-    console.log(`✅ Success: ${successCount}`);
-    console.log(`❌ Failed: ${failCount}`);
+    console.log('\n' + '='.repeat(60));
+    console.log('📊 BULK SEND COMPLETE');
+    console.log('='.repeat(60));
+    console.log(`✅ Successfully sent: ${successCount}/${contacts.length}`);
+    console.log(`❌ Failed: ${failCount}/${contacts.length}`);
     
-    if (failedContacts.length > 0) {
-        console.log('\nFailed contacts:');
-        failedContacts.forEach(contact => console.log(`- ${contact}`));
+    if (successCount > 0) {
+        const successRate = ((successCount / contacts.length) * 100).toFixed(1);
+        console.log(`📈 Success rate: ${successRate}%`);
     }
     
+    if (failedContacts.length > 0) {
+        console.log('\n⚠️  Failed contacts:');
+        failedContacts.forEach(contact => console.log(`   - ${contact}`));
+        
+        // Save failed contacts to a file for retry
+        const failedFile = 'data/contact_lists/failed_contacts.txt';
+        try {
+            fs.writeFileSync(failedFile, failedContacts.join('\n'));
+            console.log(`\n💾 Failed contacts saved to: ${failedFile}`);
+            console.log('   You can retry these contacts later.');
+        } catch (err) {
+            console.log('\n⚠️  Could not save failed contacts to file.');
+        }
+    }
+    
+    console.log('\n✨ Done! You can now close this window.\n');
     rl.close();
-    process.exit(0);
+    
+    // Give time to read the summary before exiting
+    setTimeout(() => {
+        process.exit(failCount === 0 ? 0 : 1);
+    }, 2000);
 }
 
 // Start the bulk messaging

@@ -3,11 +3,11 @@
 # Install using: npm install
 
 # Core Dependencies
-@whiskeysockets/baileys
+
 qrcode-terminal
 pino
 pino-pretty
 dotenv
 colors
-@whiskeysockets/baileys@latest 
+ 
 qrcode
