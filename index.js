@@ -5,6 +5,7 @@ import qrcode from 'qrcode-terminal';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
 import readline from 'readline';
+import fs from 'fs';
 
 // Connection state
 let sock = null;
@@ -124,13 +125,28 @@ async function sendMessage(sock, to, message, options = {}) {
     // Add @s.whatsapp.net if not present
     const jid = to.includes('@') ? to : `${to}@s.whatsapp.net`;
     
+    // Prepare message content (text or image)
+    let messageContent;
+    if (options.image) {
+      const imageInput = options.image;
+      let imageData;
+      if (imageInput.startsWith('http://') || imageInput.startsWith('https://')) {
+        imageData = { url: imageInput };
+      } else {
+        imageData = fs.readFileSync(imageInput);
+      }
+      messageContent = { image: imageData, caption: message || '' };
+    } else {
+      messageContent = { text: message };
+    }
+    
     // Send the message with retry logic
     let attempts = 0;
     const maxAttempts = 2;
     
     while (attempts < maxAttempts) {
       try {
-        await sock.sendMessage(jid, { text: message }, options);
+        await sock.sendMessage(jid, messageContent);
         logger.info('✅ Message sent successfully!');
         return true;
       } catch (error) {
@@ -401,14 +417,20 @@ async function main() {
           }
           
           rl.question('Enter phone number (with country code, no +): ', (number) => {
-            rl.question('Enter message: ', async (message) => {
-              try {
-                console.log('⏳ Sending message...');
-                await sendMessage(sock, number, message);
-              } catch (error) {
-                console.error('❌ Error:', error.message);
-              }
-              showMenu();
+            rl.question('Enter message (or press Enter to send just the image): ', async (message) => {
+              rl.question('Image path or URL (or Enter to skip): ', async (imagePath) => {
+                try {
+                  console.log('⏳ Sending message...');
+                  const options = {};
+                  if (imagePath.trim()) {
+                    options.image = imagePath.trim();
+                  }
+                  await sendMessage(sock, number, message, options);
+                } catch (error) {
+                  console.error('❌ Error:', error.message);
+                }
+                showMenu();
+              });
             });
           });
           break;

@@ -9,6 +9,8 @@ A powerful WhatsApp bot built with Node.js that provides interactive features th
 - **Interactive Menus**: Navigate features with ease
 - **Real-time Status**: Monitor bot status and uptime
 - **Bulk Messaging**: Send messages to multiple contacts at once
+- **Image/Media Sending**: Attach images (local file or URL) to any message
+- **Campaign Manager**: Create, send, and track bulk messaging campaigns with delivery analytics
 - **Auto-reconnect**: Automatically reconnects if connection is lost
 - **Rate Limit Handling**: Smart delays to prevent account restrictions
 
@@ -97,20 +99,70 @@ Send messages to multiple contacts at once:
    ```
 
 3. Follow the prompts to:
-   - Enter your message
+   - Enter your message (type `.` on a new line to finish)
+   - Optionally provide an image path or URL (or press Enter to skip)
    - Provide the path to your contacts file
    - Scan the QR code when prompted
    - Type `SEND` to start sending messages
+
+### Campaign Manager (bulkReplySystem.js)
+
+Full campaign lifecycle tool with analytics:
+
+```bash
+node bulkReplySystem.js
+```
+
+- Create a campaign with a name, message, and optional image attachment
+- Select contact list from `data/contact_lists/`
+- Sends messages with 2s rate limiting and tracks delivery/read receipts
+- Records responses from recipients
+- Send follow-up messages to past campaign recipients (with optional image)
+- Analytics dashboard with response rates and best-performing campaigns
 
 ### Terminal Interface
 
 When you run the main bot, you'll see a menu with these options:
 
 1. Show Bot Status
-2. Send Test Message
+2. Send Test Message (supports text + optional image)
 3. Get Uptime
-4. Start Bulk Messaging
-5. Exit
+4. Exit
+
+#### Sending Images via Terminal Menu
+
+When sending a test message (option 2), you'll be prompted for:
+1. **Phone number** (with country code, no `+`)
+2. **Message text** (or press Enter to send just the image)
+3. **Image path or URL** (or press Enter for text-only)
+
+Supports both local file paths (e.g. `C:\photo.jpg` or `data\images\photo.jpg`) and web URLs.
+
+## 🖼️ Image Sending
+
+All scripts support sending images alongside text messages.
+
+### Supported Formats
+
+- **Local file**: Provide an absolute or relative path (e.g. `data/images/photo.jpg` or `C:\Users\Admin\Pictures\photo.png`)
+- **Web URL**: Provide a direct image URL (e.g. `https://example.com/photo.jpg`)
+
+### How It Works
+
+When an image is provided, it's sent as a WhatsApp image with your text as the caption. If no text is entered, the image is sent with an empty caption.
+
+### Storage Recommendation
+
+Place your images in `data/images/` (create the folder if needed):
+
+```
+data/images/
+├── promo1.jpg
+├── promo2.jpg
+└── banner.png
+```
+
+Then when prompted for an image path, enter: `data/images/promo1.jpg`
 
 ## 🔧 Troubleshooting
 
@@ -149,10 +201,15 @@ When you run the main bot, you'll see a menu with these options:
 
 ## 📂 Project Structure
 
-- `index.js` - Main bot application
-- `whatsapp-qr.js` - QR code authentication
+- `index.js` - Main bot application (interactive bot + terminal menu)
+- `bulkMessage.js` - Send text/image to multiple contacts from a file
+- `bulkReplySystem.js` - Full campaign manager with analytics and follow-ups
+- `whatsapp-qr.js` - QR code authentication standalone
+- `test-connection.js` - Connection test utility
 - `package.json` - Project dependencies and scripts
 - `auth_info_baileys/` - Session storage (created after first login)
+- `data/contact_lists/` - Contact lists (one number per line)
+- `data/campaigns/` - Campaign data (auto-created)
 
 ## 📦 Dependencies
 

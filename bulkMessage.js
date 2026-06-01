@@ -68,6 +68,12 @@ async function sendBulkMessages() {
         });
         const message = lines.join('\n');
 
+        // Ask for optional image attachment
+        const image = await new Promise(resolve => {
+            rl.question('\n📷 Image path or URL (or press Enter to skip): ', resolve);
+        });
+        const attachedImage = image.trim() || null;
+
         // Use default contacts file
         const contactsFile = 'data/contact_lists/my_contacts.txt';
         console.log(`\nUsing default contacts file: ${contactsFile}`);
@@ -172,7 +178,7 @@ async function sendBulkMessages() {
                     
                     // Double-check connection is still open
                     if (isConnected) {
-                        startSending(sock, contacts, message, rl, () => isConnected, () => { isSending = true; });
+                        startSending(sock, contacts, message, rl, () => isConnected, () => { isSending = true; }, attachedImage);
                     } else {
                         console.log('\n❌ Connection lost before sending. Please try again.');
                         rl.close();
@@ -193,7 +199,7 @@ async function sendBulkMessages() {
 }
 
 // Function to send messages with delay
-async function startSending(sock, contacts, message, rl, isConnectedFn, markAsSending) {
+async function startSending(sock, contacts, message, rl, isConnectedFn, markAsSending, image = null) {
     // Final connection check before proceeding
     if (!isConnectedFn()) {
         console.log('\n❌ Connection lost before sending could start.');
@@ -203,6 +209,9 @@ async function startSending(sock, contacts, message, rl, isConnectedFn, markAsSe
     }
 
     console.log(`✅ Ready to send to ${contacts.length} contacts.`);
+    if (image) {
+        console.log(`📷 Image: ${image}`);
+    }
     console.log(`📝 Preview: ${message.substring(0, 100)}...\n`);
 
     const confirm = await new Promise(resolve => {
@@ -227,6 +236,17 @@ async function startSending(sock, contacts, message, rl, isConnectedFn, markAsSe
     }
     
     console.log('\n🚀 Starting bulk send...\n');
+    
+    // Prepare image data once (if any)
+    let bulkImageData = null;
+    if (image) {
+        if (image.startsWith('http://') || image.startsWith('https://')) {
+            bulkImageData = { url: image };
+        } else {
+            bulkImageData = fs.readFileSync(image);
+        }
+    }
+    
     let successCount = 0;
     let failCount = 0;
     const failedContacts = [];
@@ -266,6 +286,13 @@ async function startSending(sock, contacts, message, rl, isConnectedFn, markAsSe
             
             console.log(`   ✓ Number verified`);
             
+            let messageContent;
+            if (bulkImageData) {
+                messageContent = { image: bulkImageData, caption: message || '' };
+            } else {
+                messageContent = { text: message };
+            }
+            
             // Send the message with retry logic
             let sent = false;
             let retries = 0;
@@ -273,9 +300,7 @@ async function startSending(sock, contacts, message, rl, isConnectedFn, markAsSe
             
             while (!sent && retries <= maxRetries) {
                 try {
-                    await sock.sendMessage(phoneNumber, { 
-                        text: message 
-                    });
+                    await sock.sendMessage(phoneNumber, messageContent);
                     sent = true;
                 } catch (sendError) {
                     retries++;

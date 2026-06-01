@@ -232,6 +232,7 @@ async createNewCampaign() {
         // Get campaign details
         const name = await question('📝 Campaign name: ');
         const message = await question('💬 Enter your message: ');
+        const imagePath = (await question('📷 Image path or URL (or press Enter to skip): ')).trim();
         
         // Show available contact lists
         const contactLists = fs.readdirSync(CONFIG.contactsDir)
@@ -282,6 +283,7 @@ async createNewCampaign() {
             id: campaignId,
             name,
             message,
+            image: imagePath || null,
             contactList: selectedList,
             status: 'draft',
             createdAt: new Date().toISOString(),
@@ -337,6 +339,16 @@ async createNewCampaign() {
         
         console.log(`📤 Sending to ${contacts.length} contacts...\n`);
         
+        // Prepare image data once (if any)
+        let campaignImageData = null;
+        if (campaignData.image) {
+            if (campaignData.image.startsWith('http://') || campaignData.image.startsWith('https://')) {
+                campaignImageData = { url: campaignData.image };
+            } else {
+                campaignImageData = fs.readFileSync(campaignData.image);
+            }
+        }
+        
         // Send messages with rate limiting
         for (let i = 0; i < contacts.length; i++) {
             const contact = contacts[i];
@@ -345,9 +357,13 @@ async createNewCampaign() {
             try {
                 process.stdout.write(`${progress} Sending to ${contact}... `);
                 
-                await this.sock.sendMessage(`${contact}@s.whatsapp.net`, {
-                    text: campaignData.message
-                });
+                let messageContent;
+                if (campaignImageData) {
+                    messageContent = { image: campaignImageData, caption: campaignData.message || '' };
+                } else {
+                    messageContent = { text: campaignData.message };
+                }
+                await this.sock.sendMessage(`${contact}@s.whatsapp.net`, messageContent);
                 
                 campaignData.stats.sent++;
                 this.saveCampaignData(campaignId, campaignData);
@@ -481,6 +497,9 @@ async createNewCampaign() {
             console.clear();
             console.log(`📊 Campaign: ${campaignData.name || 'Unnamed Campaign'}\n`.bold.cyan);
             console.log(`📝 Message: ${campaignData.message || 'No message'}`);
+            if (campaignData.image) {
+                console.log(`📷 Image: ${campaignData.image}`);
+            }
             console.log(`📅 Created: ${campaignData.createdAt ? new Date(campaignData.createdAt).toLocaleString() : 'Unknown'}`);
             
             if (campaignData.completedAt) {
@@ -670,6 +689,7 @@ console.log('Campaign file path:', campaignFile);
             await question('\nPress Enter to continue...');
             return;
         }
+        const followUpImage = (await question('📷 Image path or URL (or press Enter to skip): ')).trim();
         
         // Get recipients from campaign data or try to load from file
         let recipients = [];
@@ -747,9 +767,20 @@ if (recipients.length === 0) {
         const followUpData = {
             id: `followup_${Date.now()}`,
             message: message,
+            image: followUpImage || null,
             sentAt: new Date().toISOString(),
             recipients: []
         };
+        
+        // Prepare image data once (if any)
+        let followUpImageData = null;
+        if (followUpImage) {
+            if (followUpImage.startsWith('http://') || followUpImage.startsWith('https://')) {
+                followUpImageData = { url: followUpImage };
+            } else {
+                followUpImageData = fs.readFileSync(followUpImage);
+            }
+        }
         
         // Track results
         let successCount = 0;
@@ -768,7 +799,13 @@ if (recipients.length === 0) {
                 process.stdout.write(`\r⏳ Sending to ${i + 1}/${recipients.length} (${progress}%)...`);
                 
                 // Send message
-                await this.sock.sendMessage(phoneNumber, { text: message });
+                let messageContent;
+                if (followUpImageData) {
+                    messageContent = { image: followUpImageData, caption: message || '' };
+                } else {
+                    messageContent = { text: message };
+                }
+                await this.sock.sendMessage(phoneNumber, messageContent);
                 
                 // Update success count
                 successCount++;
