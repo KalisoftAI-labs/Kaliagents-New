@@ -1,3 +1,14 @@
 node_modules/
 .DS_Store
 *.log
+
+# Local credentials and WhatsApp session state
+backend/.env
+backend/auth/
+frontend/.env
+
+# Local customer/order exports and editor metadata
+backend/orders.csv
+backend/customers.json
+exported_customers.csv
+**/.vscode/

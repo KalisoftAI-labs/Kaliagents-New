@@ -1,3 +1,5 @@
+
+
 const express = require('express');
 const { Server: SocketIOServer } = require('socket.io');
 const http = require('http');
@@ -17,17 +19,22 @@ require('dotenv').config({ path: require('path').join(__dirname, '.env') });
 
 const app = express();
 const server = http.createServer(app);
+const allowedOrigins = (process.env.FRONTEND_URL || 'http://localhost:3000,http://localhost:3001')
+  .split(',')
+  .map(origin => origin.trim())
+  .filter(Boolean);
+
 const io = new SocketIOServer(server, {
   cors: {
-    origin: ["http://localhost:3000", "http://localhost:3001"],
+    origin: allowedOrigins,
     methods: ["GET", "POST"]
   }
 });
 
 // Middleware
-app.use(cors());
-app.use(bodyParser.json());
-app.use(bodyParser.urlencoded({ extended: true }));
+app.use(cors({ origin: allowedOrigins }));
+app.use(bodyParser.json({ limit: '100kb' }));
+app.use(bodyParser.urlencoded({ extended: true, limit: '100kb' }));
 
 // ========================
 // COMPLETE MENU DATA
@@ -419,7 +426,7 @@ const ORDERING_CONFIG = {
 const isOrderingAllowed = () => {
   // TEST_MODE=true in .env bypasses time restriction for testing
   if (process.env.TEST_MODE === 'true') {
-    console.log('⚠️  TEST_MODE ON — time restriction bypassed');
+    console.log('TEST_MODE ON - time restriction bypassed');
     return true;
   }
   const now = new Date();
@@ -525,7 +532,7 @@ const connectWhatsApp = async () => {
             const authPath = path.join(__dirname, 'auth');
             const files = fs.readdirSync(authPath);
             for (const f of files) fs.unlinkSync(path.join(authPath, f));
-            console.log(`🗑️  Auth cleared (${files.length} files removed)`);
+            console.log(`🗑️ Auth cleared (${files.length} files removed)`);
           } catch (e) {
             console.warn('⚠️  Could not clear auth folder:', e.message);
           }
@@ -817,12 +824,19 @@ const mergeCartItems = (cartItems) => {
   const merged = new Map();
   for (const item of cartItems) {
     const key = item.id;
+    const menuItem = COMPLETE_MENU[key];
+    if (!menuItem) continue; // skip unknown items
     if (merged.has(key)) {
       const ex = merged.get(key);
       ex.quantity  += item.quantity;
-      ex.lineTotal  = ex.price * ex.quantity;
+      ex.price     = menuItem.price; // always set from menu
+      ex.lineTotal = ex.price * ex.quantity;
     } else {
-      merged.set(key, { ...item });
+      merged.set(key, {
+        ...item,
+        price: menuItem.price, // always set from menu
+        lineTotal: menuItem.price * item.quantity
+      });
     }
   }
   return Array.from(merged.values());
@@ -924,8 +938,20 @@ const confirmOrder = async (from, customerName) => {
     return;
   }
 
-  // Merge duplicates one final time before saving
-  const cart = mergeCartItems(rawCart);
+  // Merge duplicates and re-apply correct prices before saving
+  let cart = mergeCartItems(rawCart);
+  // Ensure every item has correct price and lineTotal from COMPLETE_MENU
+  cart = cart.map(item => {
+    const menuItem = COMPLETE_MENU[item.id];
+    const price = menuItem ? menuItem.price : item.price || 0;
+    const quantity = item.quantity || 1;
+    return {
+      ...item,
+      price,
+      lineTotal: price * quantity,
+      quantity
+    };
+  });
   userCart.set(from, cart);
 
   const totalPrice = cart.reduce((sum, item) => sum + item.lineTotal, 0);
@@ -987,7 +1013,7 @@ const confirmOrder = async (from, customerName) => {
     name: customerDetails.name,
     phone: customerDetails.phone,
     items: cartSummary,
-    total: totalPrice
+    total_price: totalPrice
   });
   console.log(`📡 Frontend notified`);
 
@@ -1052,8 +1078,9 @@ const getCustomerName = async (phone, pushName = null) => {
 
     // ── 3. New customer — auto-save with WhatsApp display name ──
     if (pushName && normalizedPhone) {
+      // Always store only the normalized real phone (never LID/JID)
       await pool.query(
-        'INSERT INTO customers (phone, name, whatsapp_jid) VALUES ($1, $2, $3) ON CONFLICT (phone) DO NOTHING',
+        'INSERT INTO customers (phone, name, whatsapp_jid) VALUES ($1, $2, $3) ON CONFLICT (phone) DO UPDATE SET name = $2, whatsapp_jid = COALESCE(customers.whatsapp_jid, $3)',
         [normalizedPhone, pushName, rawJid && rawJid.includes('@') ? rawJid : null]
       );
       console.log(`✅ Auto-saved new customer: ${pushName} (${normalizedPhone})`);
@@ -1215,48 +1242,6 @@ app.get('/api/status', (req, res) => {
     status: connectionStatus,
     qrCode: qrCodeUrl
   });
-});
-
-app.get('/api/orders', async (req, res) => {
-  try {
-    const result = await pool.query(
-      'SELECT id, timestamp, name, phone, items, total_price, status FROM orders ORDER BY timestamp DESC'
-    );
-    const orders = result.rows.map(order => ({
-      ...order,
-      items: typeof order.items === 'string' ? order.items : JSON.stringify(order.items)
-    }));
-    res.json(orders);
-  } catch (error) {
-    console.error('❌ Error fetching orders:', error.message);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.get('/api/menu', (req, res) => {
-  res.json(Object.values(COMPLETE_MENU));
-});
-
-app.post('/api/customers', async (req, res) => {
-  let { phone, name, address } = req.body;
-  
-  if (!phone || !name) {
-    return res.status(400).json({ error: 'Phone and name are required' });
-  }
-
-  // ✅ NEW: Normalize phone number
-  const normalizedPhone = normalizePhone(phone);
-
-  try {
-    await pool.query(
-      'INSERT INTO customers (phone, name, address) VALUES ($1, $2, $3) ON CONFLICT (phone) DO UPDATE SET name = $2, address = $3',
-      [normalizedPhone, name, address || null]
-    );
-    res.json({ success: true, message: 'Customer added', phone: normalizedPhone });
-  } catch (error) {
-    console.error('❌ Error adding customer:', error.message);
-    res.status(500).json({ error: error.message });
-  }
 });
 
 app.get('/api/customers', async (req, res) => {
